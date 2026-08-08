@@ -42,6 +42,49 @@ The server has no built-in authentication. Do not expose it directly to the inte
 or an untrusted LAN. See [Deployment and security](docs/deployment.md) before changing
 the listener or published-port address.
 
+## Usage
+
+Point any MCP client that speaks Streamable HTTP at `http://127.0.0.1:8080/mcp`.
+For Claude Code:
+
+```sh
+claude mcp add --transport http matrix http://127.0.0.1:8080/mcp
+```
+
+or in a client's JSON configuration:
+
+```json
+{
+  "mcpServers": {
+    "matrix": { "type": "http", "url": "http://127.0.0.1:8080/mcp" }
+  }
+}
+```
+
+A typical session from the client:
+
+1. `matrix_describe_device` — confirm the panel's identity, dimensions, and power
+   headroom before displaying content.
+2. `matrix_show_text` with `{"text": "HELLO"}` — text that fits shows as a centered
+   still; longer text scrolls as a marquee until stopped.
+3. `matrix_submit_asset` with a base64 `data:` URI, then `matrix_play` with the
+   returned asset handle.
+4. `matrix_stop` — the panel returns to its configured ambient behaviour.
+
+### Tools
+
+| Tool | Purpose |
+| --- | --- |
+| `matrix_describe_device` | Panel identity, firmware, dimensions, achieved framerate, and power draw |
+| `matrix_status` | What is playing, how many assets are held, last reported framerate |
+| `matrix_submit_asset` | Normalize media into frames and hold it; returns an asset handle |
+| `matrix_list_assets` | List the assets currently held |
+| `matrix_play` | Play a held asset, replacing whatever was playing |
+| `matrix_show_text` | Centered still or scrolling marquee text |
+| `matrix_stop` | Stop playback; the panel returns to ambient behaviour |
+| `matrix_set_brightness` | Set panel brightness, 0 to 255 |
+| `matrix_power` | Turn the panel on or off |
+
 ## Configuration and support
 
 - [Configuration reference](docs/configuration.md)
