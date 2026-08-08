@@ -141,4 +141,4 @@ Compose file builds the checked-out revision locally.
 
 ## License
 
-MIT
+MIT. See [LICENSE](LICENSE).

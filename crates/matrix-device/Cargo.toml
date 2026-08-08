@@ -4,6 +4,7 @@ description = "WLED device plane: JSON API client for configuration and state, D
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+rust-version.workspace = true
 repository.workspace = true
 
 [dependencies]

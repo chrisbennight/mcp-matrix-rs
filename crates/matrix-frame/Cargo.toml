@@ -4,6 +4,7 @@ description = "Canvas geometry and the fixed-rate frame representation shared by
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+rust-version.workspace = true
 repository.workspace = true
 
 [dependencies]
