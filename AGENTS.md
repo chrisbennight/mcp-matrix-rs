@@ -8,7 +8,7 @@ Guidance for working in `mcp-matrix-rs`.
 and media through MCP, normalizes content to fixed-rate RGB frames, and drives the
 panel over DDP.
 
-- Repository: `https://github.com/bennight/mcp-matrix-rs`
+- Repository: `https://github.com/chrisbennight/mcp-matrix-rs`
 - Verified hardware: Apollo Automation M-1, 64x64 RGB HUB75, WLED firmware
 - Protocol: MCP `2026-07-28` over Streamable HTTP at `/mcp`
 - Trust model: the application has no built-in authentication; operators define the
