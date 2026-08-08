@@ -1,0 +1,10 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/chrisbennight/mcp-matrix-rs/security/advisories/new
+    about: >-
+      Report vulnerabilities privately. Do not include credential values, private
+      deployment addresses, or weaponized media in a public issue.
+  - name: Documentation
+    url: https://github.com/chrisbennight/mcp-matrix-rs/tree/main/docs
+    about: Configuration, deployment and security, and hardware compatibility.

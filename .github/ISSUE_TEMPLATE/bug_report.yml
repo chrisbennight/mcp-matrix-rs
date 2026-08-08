@@ -1,0 +1,55 @@
+name: Bug report
+description: Something behaves incorrectly or fails
+labels: ["bug"]
+body:
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you did, what you expected, and what happened instead.
+      placeholder: |
+        Called matrix_show_text with ... and expected ... but the panel ...
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Server version
+      description: Image tag, release tag, or commit SHA.
+      placeholder: ghcr.io/chrisbennight/mcp-matrix-rs:0.1.0
+    validations:
+      required: true
+  - type: dropdown
+    id: deployment
+    attributes:
+      label: How it runs
+      options:
+        - Container (compose or docker run)
+        - Local cargo build
+        - Other
+    validations:
+      required: true
+  - type: input
+    id: hardware
+    attributes:
+      label: Panel hardware and WLED version
+      description: >-
+        The power model is calibrated for the Apollo Automation M-1; behaviour on
+        other panels is diagnostic information, not a support commitment.
+      placeholder: Apollo M-1 64x64, WLED 0.15.0
+    validations:
+      required: true
+  - type: textarea
+    id: config
+    attributes:
+      label: Relevant configuration
+      description: >-
+        The MATRIX_* settings involved. Replace real addresses and hostnames with
+        documentation values such as 192.0.2.10 before posting.
+      render: text
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: Server log lines around the failure, with any addresses redacted.
+      render: text
