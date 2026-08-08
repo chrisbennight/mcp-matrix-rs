@@ -1,5 +1,9 @@
 # mcp-matrix-rs
 
+[![test](https://github.com/chrisbennight/mcp-matrix-rs/actions/workflows/test.yml/badge.svg)](https://github.com/chrisbennight/mcp-matrix-rs/actions/workflows/test.yml)
+[![image](https://github.com/chrisbennight/mcp-matrix-rs/actions/workflows/image.yml/badge.svg)](https://github.com/chrisbennight/mcp-matrix-rs/actions/workflows/image.yml)
+[![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 `mcp-matrix-rs` turns a WLED-driven RGB matrix into an MCP display. It renders text
 and small inline media into fixed-rate RGB frames, applies a panel power budget, and
 streams the result over DDP.
