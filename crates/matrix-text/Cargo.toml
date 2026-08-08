@@ -1,0 +1,15 @@
+[package]
+name = "matrix-text"
+description = "Rasterize strings into frame sequences: stills when they fit, marquee scrolls when they do not"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+matrix-frame = { path = "../matrix-frame" }
+
+# Public-domain 8x8 bitmap font as const data: no parsing, no allocation, no
+# rasterizer attack surface. A vector font would be wasted on a 64-pixel panel.
+font8x8 = "0.3"
+thiserror.workspace = true

@@ -1,0 +1,19 @@
+[package]
+name = "matrix-device"
+description = "WLED device plane: JSON API client for configuration and state, DDP transport for frames"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+matrix-frame = { path = "../matrix-frame" }
+thiserror.workspace = true
+tokio = { version = "1", features = ["net", "time", "rt"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }

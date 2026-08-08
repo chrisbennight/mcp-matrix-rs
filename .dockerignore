@@ -1,0 +1,13 @@
+# Keep the build context lean. The builder copies the whole workspace (cargo must
+# parse every member to build one crate), so exclude only the large or irrelevant
+# trees — never the crates, Cargo manifests, or docs that Cargo metadata and runtime
+# guidance may reference.
+.git
+.github
+.worktrees
+target
+**/target
+.claude
+.env*
+*.key
+*.pem

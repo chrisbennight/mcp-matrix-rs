@@ -1,0 +1,42 @@
+[package]
+name = "matrix-server"
+description = "MCP 2026-07-28 server: streamable HTTP transport, tool dispatch, and the engine it drives"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "matrix-server"
+path = "src/main.rs"
+
+[dependencies]
+matrix-frame = { path = "../matrix-frame" }
+matrix-device = { path = "../matrix-device" }
+matrix-media = { path = "../matrix-media" }
+matrix-playout = { path = "../matrix-playout" }
+matrix-text = { path = "../matrix-text" }
+
+rmcp = { version = "3", default-features = false, features = [
+    "server",
+    "macros",
+    "transport-streamable-http-server",
+] }
+axum = "0.8"
+# Used only by the --healthcheck self-probe (a plain loopback GET).
+reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+serde = { version = "1", features = ["derive"] }
+# preserve_order keeps response object keys in declared order for stable wire output.
+serde_json = { version = "1", features = ["preserve_order"] }
+schemars = "1"
+base64 = "0.22"
+clap = { version = "4", features = ["derive", "env"] }
+thiserror.workspace = true
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }

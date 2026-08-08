@@ -1,0 +1,4 @@
+[toolchain]
+# renovate: datasource=github-releases depName=rust-lang/rust
+channel = "1.97.1"
+components = ["rustfmt", "clippy"]

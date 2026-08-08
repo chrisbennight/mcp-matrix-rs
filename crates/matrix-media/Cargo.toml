@@ -1,0 +1,19 @@
+[package]
+name = "matrix-media"
+description = "Ingest and normalization: arbitrary media in, one fixed-rate frame sequence out"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+matrix-frame = { path = "../matrix-frame" }
+thiserror.workspace = true
+tracing = "0.1"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+tokio = { version = "1", features = ["process", "io-util", "time", "rt", "macros"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }

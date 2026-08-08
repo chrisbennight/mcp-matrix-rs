@@ -1,0 +1,17 @@
+[package]
+name = "matrix-playout"
+description = "Fixed-rate frame pump: rate adaptation from device feedback and power clamping on the send path"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+matrix-frame = { path = "../matrix-frame" }
+matrix-device = { path = "../matrix-device" }
+thiserror.workspace = true
+tokio = { version = "1", features = ["time", "rt", "sync", "macros"] }
+tracing = "0.1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }

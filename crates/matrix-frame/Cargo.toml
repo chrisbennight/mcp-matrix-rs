@@ -1,0 +1,10 @@
+[package]
+name = "matrix-frame"
+description = "Canvas geometry and the fixed-rate frame representation shared by ingest and playout"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+thiserror.workspace = true

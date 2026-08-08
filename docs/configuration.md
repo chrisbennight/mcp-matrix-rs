@@ -1,0 +1,31 @@
+# Configuration
+
+`matrix-server` accepts each setting as a command-line option and as the environment
+variable listed below. Run `matrix-server --help` for the corresponding option names.
+
+| Environment variable | Required | Default | Meaning |
+| --- | --- | --- | --- |
+| `MATRIX_WLED_URL` | yes | none | WLED device origin, such as `http://192.0.2.10` |
+| `MATRIX_DDP_ADDR` | yes | none | Numeric panel IP and DDP port, normally `192.0.2.10:4048` |
+| `MATRIX_HTTP_ADDR` | no | `127.0.0.1:8080` | Streamable HTTP listener; the container overrides this to `0.0.0.0:8080` |
+| `MATRIX_ALLOWED_HOSTS` | no | `localhost,127.0.0.1,::1` | Complete comma-separated Host-header allowlist for `/mcp` |
+| `MATRIX_WIDTH` | no | `64` | Render canvas width in pixels |
+| `MATRIX_HEIGHT` | no | `64` | Render canvas height in pixels |
+| `MATRIX_TARGET_FPS` | no | `25` | Requested whole-frame rate from 1 through 240 |
+| `MATRIX_DEVICE_TIMEOUT_MS` | no | `3000` | Timeout for WLED JSON API calls |
+| `MATRIX_FFMPEG_BIN` | no | `ffmpeg` | FFmpeg executable path |
+| `MATRIX_FFPROBE_BIN` | no | `ffprobe` | ffprobe executable path |
+
+The width and height must describe the WLED matrix layout. The server reports the
+dimensions returned by WLED but does not currently reconcile a mismatch automatically.
+Confirm the result with `matrix_describe_device` before displaying content.
+
+`MATRIX_DDP_ADDR` is parsed as a socket address and therefore requires an IP literal,
+not an mDNS or DNS hostname. The HTTP URL may use a hostname.
+
+`MATRIX_ALLOWED_HOSTS` is a DNS-rebinding defense, not authentication. Include every
+authority through which an MCP client reaches the service, without a URL scheme. The
+`/healthz` liveness endpoint is intentionally outside this check.
+
+The container pins FFmpeg and ffprobe to `/usr/bin`. Override their paths only when
+running the standalone binary with a deliberately selected installation.

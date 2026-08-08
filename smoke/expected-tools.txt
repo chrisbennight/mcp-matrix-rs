@@ -1,0 +1,9 @@
+matrix_describe_device
+matrix_list_assets
+matrix_play
+matrix_power
+matrix_set_brightness
+matrix_show_text
+matrix_status
+matrix_stop
+matrix_submit_asset
