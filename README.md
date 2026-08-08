@@ -8,6 +8,12 @@ The verified target is the Apollo Automation M-1: a 64x64 HUB75 panel running WL
 Other WLED RGB matrices may work, but the electrical model is calibrated for that
 hardware; see [Compatibility](docs/compatibility.md) before using another panel.
 
+## Why
+
+WLED can already run built-in effects, and tools like xLights or LedFx can stream pixels to it. What none of that provides is a safe way for an AI agent to put arbitrary content on the panel: something has to rasterize text, decode untrusted media inside hard limits, pace frames to the rate the panel actually achieves, and keep the output inside the panel's power budget.
+
+`mcp-matrix-rs` is that layer. It gives any MCP client a physical display it can drive with a tool call, while the server owns normalization, rate adaptation, and power clamping. The caller never touches raw frames or the device.
+
 ## What works
 
 - MCP `2026-07-28` over Streamable HTTP at `/mcp`
