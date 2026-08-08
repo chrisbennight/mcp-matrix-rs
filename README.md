@@ -114,6 +114,17 @@ A typical session from the client:
 
 The workspace uses the toolchain pinned in `rust-toolchain.toml`.
 
+Current crate organization/purpose:
+
+| Crate | Purpose |
+| --- | --- |
+| `matrix-frame` | Canvas geometry and the fixed-rate frame representation; no I/O or device knowledge |
+| `matrix-device` | WLED JSON client for configuration and state, DDP transport for frames |
+| `matrix-media` | Untrusted media decode and normalization, out of process under a deadline and limits |
+| `matrix-playout` | Rate adaptation, power clamping, and paced sends; the only frame-send path |
+| `matrix-text` | Rasterizing text into the shared frame representation |
+| `matrix-server` | The binary: MCP transport, tool dispatch, and shared engine state |
+
 ```sh
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
