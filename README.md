@@ -32,6 +32,12 @@ WLED can already run built-in effects, and tools like xLights or LedFx can strea
 Media submitted through MCP is limited to a 16 KiB base64 `data:` URI. Larger-media
 transfer is planned; text and native-resolution still images fit within this limit.
 
+## Status and non-goals
+
+This is an early release, verified on one panel model, and maintained as a personal project. Review [PLAN.md](PLAN.md) before depending on behaviour that is not in a tagged release.
+
+Deliberate non-goals: the server does not authenticate clients (operators own that boundary), does not fetch caller-supplied URLs, and does not claim support for panels beyond the verified hardware. The reasoning is recorded in [DECISIONS.md](DECISIONS.md).
+
 ## Quick start
 
 You need Docker, Docker Compose, and a WLED device reachable from the Docker host by
