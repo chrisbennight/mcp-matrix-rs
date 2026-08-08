@@ -64,7 +64,7 @@ docker build -t mcp-matrix-rs:local .
 Unit and integration tests use loopback fakes and never contact a real panel. See
 [CONTRIBUTING.md](CONTRIBUTING.md) for the repository workflow.
 
-Version tags publish matching versioned images to `ghcr.io/bennight/mcp-matrix-rs`
+Version tags publish matching versioned images to `ghcr.io/chrisbennight/mcp-matrix-rs`
 (`v1.2.3` publishes `:1.2.3`). No mutable `latest` alias is published. The example
 Compose file builds the checked-out revision locally.
 

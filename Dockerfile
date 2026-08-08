@@ -29,7 +29,7 @@ RUN useradd --uid 10001 --create-home --shell /usr/sbin/nologin app
 COPY --from=build /app/target/release/matrix-server /usr/local/bin/matrix-server
 
 ARG SOURCE_REVISION
-LABEL org.opencontainers.image.source="https://github.com/bennight/mcp-matrix-rs" \
+LABEL org.opencontainers.image.source="https://github.com/chrisbennight/mcp-matrix-rs" \
       org.opencontainers.image.revision="${SOURCE_REVISION}" \
       org.matrix.role="server"
 
