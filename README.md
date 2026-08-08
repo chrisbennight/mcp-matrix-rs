@@ -1,3 +1,5 @@
+![Prompt to Panel: an MCP tool call driving a radar and shield animation on an Apollo Automation M-1 LED matrix](docs/assets/mcp-matrix-rs-banner.png)
+
 # mcp-matrix-rs
 
 [![test](https://github.com/chrisbennight/mcp-matrix-rs/actions/workflows/test.yml/badge.svg)](https://github.com/chrisbennight/mcp-matrix-rs/actions/workflows/test.yml)
