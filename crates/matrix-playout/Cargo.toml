@@ -4,6 +4,7 @@ description = "Fixed-rate frame pump: rate adaptation from device feedback and p
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+rust-version.workspace = true
 repository.workspace = true
 
 [dependencies]

@@ -4,6 +4,7 @@ description = "Ingest and normalization: arbitrary media in, one fixed-rate fram
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+rust-version.workspace = true
 repository.workspace = true
 
 [dependencies]

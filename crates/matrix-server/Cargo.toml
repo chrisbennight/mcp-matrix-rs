@@ -4,6 +4,7 @@ description = "MCP 2026-07-28 server: streamable HTTP transport, tool dispatch, 
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+rust-version.workspace = true
 repository.workspace = true
 
 [[bin]]
