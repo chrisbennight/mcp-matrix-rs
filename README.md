@@ -67,8 +67,8 @@ A typical session from the client:
    headroom before displaying content.
 2. `matrix_show_text` with `{"text": "HELLO"}` — text that fits shows as a centered
    still; longer text scrolls as a marquee until stopped.
-3. `matrix_submit_asset` with a base64 `data:` URI, then `matrix_play` with the
-   returned asset handle.
+3. `matrix_submit_asset` with a base64 `data:` URI (16 KiB limit), then
+   `matrix_play` with the returned asset handle.
 4. `matrix_stop` — the panel returns to its configured ambient behaviour.
 
 ### Tools
