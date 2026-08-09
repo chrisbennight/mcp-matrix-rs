@@ -43,7 +43,8 @@ freezing a frame.
 - `matrix-device` owns the WLED JSON client and DDP transport.
 - `matrix-media` owns bounded, out-of-process decode and normalization of byte media.
 - `matrix-playout` owns rate adaptation, power clamping, and the paced frame-send path.
-- `matrix-text` rasterizes strings into the same frame representation without a decoder.
+- `matrix-text` rasterizes strings into the same frame representation without a decoder,
+  including multi-region layouts of fixed and scrolling text.
 - `matrix-server` owns the binary, MCP transport, tool dispatch, and shared engine state.
 
 The standalone binary binds to loopback by default and serves plaintext HTTP. Operators

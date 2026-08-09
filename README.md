@@ -80,6 +80,8 @@ An alert screen readable from across the room: incident header and count, affect
 - MCP `2026-07-28` over Streamable HTTP at `/mcp`
 - centered and scrolling text; input is capped at 100 characters, and long marquees
   must also fit the configured frame budget
+- multi-region text layouts: up to 16 non-overlapping rectangles of fixed or
+  scrolling text composed into one animated package
 - PNG, GIF, and video normalization through isolated FFmpeg subprocesses
 - fixed-rate playout with feedback from WLED's reported frame rate
 - software power clamping before frames reach the panel
@@ -154,6 +156,7 @@ A typical session from the client:
 | `matrix_list_assets` | List the assets currently held |
 | `matrix_play` | Play a held asset, replacing whatever was playing |
 | `matrix_show_text` | Centered still or scrolling marquee text |
+| `matrix_show_text_layout` | Fixed and scrolling text regions composed into one animated package |
 | `matrix_stop` | Stop playback; the panel returns to ambient behaviour |
 | `matrix_set_brightness` | Set panel brightness, 0 to 255 |
 | `matrix_power` | Turn the panel on or off |

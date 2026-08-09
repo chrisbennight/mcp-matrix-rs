@@ -7,7 +7,7 @@
 //! mechanism.
 
 use crate::state::Engine;
-use crate::tools::{self, FileValue};
+use crate::tools::{self, FileValue, RegionParam};
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CacheScope, ListToolsResult, PaginatedRequestParams};
 use rmcp::service::RequestContext;
@@ -34,12 +34,14 @@ impl MatrixHandler {
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct SubmitParams {
     /// The media to normalize and hold.
     pub source: FileValue,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct PlayParams {
     /// An asset handle returned by `matrix_submit_asset`.
     pub asset: String,
@@ -49,6 +51,7 @@ pub struct PlayParams {
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct StopParams {
     /// A playback handle. Omitted stops whatever is playing; supplied and stale is
     /// refused rather than cancelling something the caller did not start.
@@ -57,6 +60,7 @@ pub struct StopParams {
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ShowTextParams {
     /// The text to display. Input is capped at 100 characters; scrolling text must
     /// also fit the configured canvas and frame budget. ASCII renders exactly;
@@ -73,12 +77,28 @@ fn default_true() -> bool {
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ShowTextLayoutParams {
+    /// The text regions to compose, at most 16. Rectangles must lie on the canvas
+    /// and must not overlap; fixed text must fit its rectangle, and scrolling text
+    /// must fit it across the axis it does not travel.
+    #[schemars(length(min = 1, max = 16))]
+    pub regions: Vec<RegionParam>,
+    /// Start playing immediately. Defaults to true; false holds the asset for a
+    /// later `matrix_play`.
+    #[serde(default = "default_true")]
+    pub play: bool,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct BrightnessParams {
     /// 0 to 255.
     pub level: u8,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct PowerParams {
     pub on: bool,
 }
@@ -207,6 +227,37 @@ impl MatrixHandler {
             "asset": asset,
             "playback": playback,
             "visible_chars": visible,
+            "scrolls": asset.frames > 1,
+        }))
+    }
+
+    #[tool(
+        description = "Compose fixed and scrolling text regions into one animated \
+                       package. Each region has a rectangle, text, style, and either \
+                       fixed alignment or a scroll path (four canonical paths, each \
+                       reversible) with a speed in pixels per second. Every scroller \
+                       starts together, crosses its rectangle, and exits; the longest \
+                       one sets the package length and looping repeats the whole \
+                       package. Rectangles must not overlap. Returns the asset handle \
+                       and, when played, the playback handle.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
+    )]
+    async fn matrix_show_text_layout(
+        &self,
+        Parameters(ShowTextLayoutParams { regions, play }): Parameters<ShowTextLayoutParams>,
+    ) -> Result<String, McpError> {
+        let (asset, playback) = tools::show_text_layout(&self.engine, &regions, play)
+            .await
+            .map_err(|e| fail(&e, e.code()))?;
+        json(&serde_json::json!({
+            "asset": asset,
+            "playback": playback,
+            "regions": regions.len(),
             "scrolls": asset.frames > 1,
         }))
     }

@@ -6,6 +6,23 @@ All notable changes to this project are documented in this file. The format foll
 
 ## [Unreleased]
 
+### Changed
+
+- Tool parameters now refuse unknown fields instead of silently ignoring them, so a
+  typo'd key surfaces as a deserialization error rather than a wrong render. The
+  `source` file object keeps accepting unknown keys because its shape follows an
+  external draft that may grow fields.
+
+### Added
+
+- `matrix_show_text_layout` tool: composes up to 16 non-overlapping rectangular text
+  regions — fixed (left/center/right aligned) or scrolling along four canonical
+  paths, each reversible, at a speed in pixels per second capped at the panel's
+  frame rate — into one bounded fixed-rate package. The longest scroller sets the
+  package length, finished scrollers park outside their destination edge, and
+  looping repeats the whole package. Layout refusals carry stable `matrix_layout_*`
+  error codes; per-region text problems reuse the existing `matrix_text_*` codes.
+
 ## [0.1.0] - 2026-08-08
 
 Initial public release.
