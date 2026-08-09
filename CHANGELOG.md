@@ -8,6 +8,14 @@ All notable changes to this project are documented in this file. The format foll
 
 ### Added
 
+- Layout scroll cadence: a `matrix_show_text_layout` scroll region accepts
+  `repeat: true` to re-enter for as many evenly spaced crossings as fit the
+  package instead of crossing once and parking, and `phase` (0 to below 1,
+  requires `repeat`) to offset where in its cycle the region starts. The package
+  length and frame budget are unchanged; regions with different cycle lengths and
+  phases drift against each other, so a composition animates continuously and
+  appears to loop independently. Refusals carry the new `matrix_layout_bad_phase`
+  code.
 - stdio transport: `matrix-server --stdio` (or `MATRIX_STDIO=1`) serves MCP over
   stdin/stdout for the single client that spawned the process, for MCP clients
   without remote-server support. The tool catalog is identical to the Streamable

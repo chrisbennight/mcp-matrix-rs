@@ -103,3 +103,26 @@ The trade is concurrency. The HTTP server multiplexes callers over one engine; e
 stdio process is a full engine that believes it exclusively owns the panel. That fits
 the intended audience — one desktop client per panel — and the deployment guide says
 so rather than the server attempting cross-process coordination.
+
+## Repeating scrollers tile the package rather than extending it
+
+A layout scroller crosses its rectangle once and parks, so a composition mixing a
+long chyron with short vertical tickers leaves the short regions blank for most of
+the package. The fix keeps the bounded-package model: a `repeat` scroller runs
+`floor(package / crossing)` evenly spaced crossings — always a whole number — inside
+the unchanged package length, and a `phase` offsets where in its cycle the region
+starts.
+
+Two alternatives lost. Giving each region its own free-running period needs a
+package as long as the least common multiple of every period to loop seamlessly,
+which explodes past the frame budget for almost any real mix of speeds. Rendering
+text procedurally at playout time would avoid pre-rendering entirely but breaks two
+standing invariants: one internal representation for all content, and ingest never
+touching playout.
+
+The trade is that cycles are quantized to the package: a region's true period is
+`package / k`, not exactly `crossing`, and every region still shares one global
+restart every package. Whole-cycle tiling keeps that restart invisible: the wrap
+continues each region's motion by exactly one ordinary step, never a jump. For an
+unphased region the wrap falls in its idle gap; a phase can place it mid-crossing,
+where the glyphs are visible but still advance as if no seam existed.
