@@ -49,8 +49,8 @@ smoke — as one argument-free command. The individual gates it runs:
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 cargo test --workspace --all-features --locked
-docker build -t mcp-matrix-rs:local .
-smoke/image.sh mcp-matrix-rs:local
+docker build -t mcp-matrix-rs:verify .
+smoke/image.sh mcp-matrix-rs:verify
 ```
 
 CI targets Linux/amd64. Unit and integration tests must use loopback fakes and never
