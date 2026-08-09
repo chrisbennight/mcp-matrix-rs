@@ -959,7 +959,7 @@ checksum = "47e1ffaa40ddd1f3ed91f717a33c8c0ee23fff369e3aa8772b9605cc1d22f4c3"
 
 [[package]]
 name = "matrix-device"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "matrix-frame",
  "reqwest",
@@ -972,14 +972,14 @@ dependencies = [
 
 [[package]]
 name = "matrix-frame"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "thiserror",
 ]
 
 [[package]]
 name = "matrix-media"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "libc",
  "matrix-frame",
@@ -990,7 +990,7 @@ dependencies = [
 
 [[package]]
 name = "matrix-playout"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "matrix-device",
  "matrix-frame",
@@ -1001,7 +1001,7 @@ dependencies = [
 
 [[package]]
 name = "matrix-server"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -1026,7 +1026,7 @@ dependencies = [
 
 [[package]]
 name = "matrix-text"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "font8x8",
  "matrix-frame",

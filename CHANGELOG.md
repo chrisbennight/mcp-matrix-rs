@@ -6,6 +6,8 @@ All notable changes to this project are documented in this file. The format foll
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-08-09
+
 ### Changed
 
 - Tool parameters now refuse unknown fields instead of silently ignoring them, so a
@@ -44,5 +46,6 @@ Initial public release.
 - Versioned container images published to `ghcr.io/chrisbennight/mcp-matrix-rs` on
   release tags.
 
-[Unreleased]: https://github.com/chrisbennight/mcp-matrix-rs/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/chrisbennight/mcp-matrix-rs/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/chrisbennight/mcp-matrix-rs/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/chrisbennight/mcp-matrix-rs/releases/tag/v0.1.0

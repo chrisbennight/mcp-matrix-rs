@@ -328,7 +328,7 @@ const TOOL_LIST_TTL_MS: u64 = 300_000;
 
 #[tool_handler(
     name = "matrix-server",
-    version = "0.1.0",
+    version = "0.2.0",
     instructions = "Renders media to a WLED LED matrix. Submit media to get an asset \
                     handle, then play that handle. Playback is paced by the framerate \
                     the panel reports and each frame is clamped to the panel's power \
