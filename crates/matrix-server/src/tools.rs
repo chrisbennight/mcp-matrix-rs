@@ -455,8 +455,9 @@ pub enum BehaviorParam {
         /// Fraction of this region's cycle, at least 0 and below 1, by which its
         /// timeline starts advanced — regions with different phases enter at
         /// different moments instead of all together. Requires `repeat: true`.
+        /// Applied in thousandths of a cycle, rounded.
         #[serde(default)]
-        #[schemars(range(min = 0.0, max = 0.999))]
+        #[schemars(range(min = 0.0), extend("exclusiveMaximum" = 1.0))]
         phase: f64,
     },
 }
@@ -880,24 +881,30 @@ mod tests {
             }
         }
 
-        let spec = spec_for(serde_json::json!({
-            "type": "scroll",
-            "path": "left_to_right",
-            "speed_px_s": 10,
-            "repeat": true,
-            "phase": 0.25
-        }));
-        assert_eq!(
-            spec.behavior,
-            RegionBehavior::Scroll {
-                path: ScrollPath::LeftToRight,
-                direction: ScrollDirection::Normal,
-                speed_px_s: 10,
-                cadence: Cadence::Repeat {
-                    phase_per_mille: 250
+        // 0.2506 rounds up to 251 thousandths — a truncating conversion would
+        // produce 250 and fail here. 0.9999 rounds to 1000 and must saturate at
+        // the engine's 999 ceiling, pinning the accepted upper edge below 1.
+        for (phase, per_mille) in [(0.2506, 251), (0.9999, 999)] {
+            let spec = spec_for(serde_json::json!({
+                "type": "scroll",
+                "path": "left_to_right",
+                "speed_px_s": 10,
+                "repeat": true,
+                "phase": phase
+            }));
+            assert_eq!(
+                spec.behavior,
+                RegionBehavior::Scroll {
+                    path: ScrollPath::LeftToRight,
+                    direction: ScrollDirection::Normal,
+                    speed_px_s: 10,
+                    cadence: Cadence::Repeat {
+                        phase_per_mille: per_mille
+                    },
                 },
-            },
-        );
+                "phase {phase}"
+            );
+        }
     }
 
     #[test]
@@ -1013,6 +1020,24 @@ mod tests {
             style["properties"]["scale"]["maximum"],
             serde_json::json!(4)
         );
+
+        // The published phase window must match what deserialization accepts —
+        // half-open [0, 1) — or a schema-validating client cannot submit values
+        // the server takes.
+        let behavior =
+            serde_json::to_value(schemars::schema_for!(BehaviorParam)).expect("schema serializes");
+        let phase = behavior["oneOf"]
+            .as_array()
+            .expect("tagged variants")
+            .iter()
+            .find_map(|variant| {
+                let phase = &variant["properties"]["phase"];
+                (!phase.is_null()).then_some(phase)
+            })
+            .expect("a variant carries phase");
+        assert_eq!(phase["minimum"], serde_json::json!(0.0));
+        assert_eq!(phase["exclusiveMaximum"], serde_json::json!(1.0));
+        assert_eq!(phase["maximum"], serde_json::Value::Null);
     }
 
     #[test]

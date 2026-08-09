@@ -122,5 +122,7 @@ touching playout.
 
 The trade is that cycles are quantized to the package: a region's true period is
 `package / k`, not exactly `crossing`, and every region still shares one global
-restart every package. Whole-cycle tiling keeps that restart invisible — each
-region's loop seam lands inside its own gap, never mid-glyph.
+restart every package. Whole-cycle tiling keeps that restart invisible: the wrap
+continues each region's motion by exactly one ordinary step, never a jump. For an
+unphased region the wrap falls in its idle gap; a phase can place it mid-crossing,
+where the glyphs are visible but still advance as if no seam existed.
