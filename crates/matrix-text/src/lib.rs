@@ -8,10 +8,16 @@
 //! A string that fits the canvas is one centered still frame. A longer one becomes a
 //! marquee: it enters from the right edge and scrolls until it has fully left, one
 //! pixel per frame, which at the panel's rates reads at a comfortable pace.
+//!
+//! The [`layout`] module composes multiple rectangular text regions — fixed or
+//! scrolling along eight directions — into one such sequence, for chyron-style
+//! displays that mix a fixed headline with moving tickers.
 
 use font8x8::{BASIC_FONTS, UnicodeFonts};
 use matrix_frame::{Canvas, Frame, FrameError, FrameSequence, Rate, Rgb};
 use thiserror::Error;
+
+pub mod layout;
 
 /// Longest accepted string.
 ///
@@ -21,7 +27,7 @@ use thiserror::Error;
 pub const MAX_TEXT_CHARS: usize = 100;
 
 /// Glyph cell edge in the source font.
-const GLYPH_PX: usize = 8;
+pub(crate) const GLYPH_PX: usize = 8;
 
 #[derive(Debug, Error)]
 pub enum TextError {
@@ -109,22 +115,7 @@ pub fn render(
     style: TextStyle,
     frame_budget: u64,
 ) -> Result<FrameSequence, TextError> {
-    if text.is_empty() {
-        return Err(TextError::Empty);
-    }
-    // Counted before any allocation, so refused text costs a scan of the string it
-    // arrived in and nothing more.
-    let count = text.chars().count();
-    if count > MAX_TEXT_CHARS {
-        return Err(TextError::TooLong {
-            actual: count,
-            limit: MAX_TEXT_CHARS,
-        });
-    }
-    if !(1..=4).contains(&style.scale) {
-        return Err(TextError::BadScale(style.scale));
-    }
-    let glyphs: Vec<[u8; GLYPH_PX]> = text.chars().map(glyph_for).collect();
+    let glyphs = validated_glyphs(text, style.scale)?;
 
     let scale = style.scale as i32;
     let cell = GLYPH_PX as i32 * scale;
@@ -183,26 +174,100 @@ fn compose(
     if style.background != Rgb::new(0, 0, 0) {
         frame.fill(style.background);
     }
+    let clip = Clip {
+        x0: 0,
+        y0: 0,
+        x1: i32::from(canvas.width()),
+        y1: i32::from(canvas.height()),
+    };
+    draw_glyph_run(&mut frame, clip, glyphs, left, top, style);
+    frame
+}
 
+/// Half-open pixel bounds a glyph run may light.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Clip {
+    pub x0: i32,
+    pub y0: i32,
+    pub x1: i32,
+    pub y1: i32,
+}
+
+/// Draw a glyph run at `(left, top)` into `frame`, lighting only pixels inside `clip`.
+///
+/// Pixels outside the clip are skipped silently: a scrolling run is partly outside
+/// its bounds for most of its life, and clipping at draw time is what motion means.
+/// Work scales with the glyphs actually visible, not the run's length: the visible
+/// index window is computed once, and row and column extents are clamped against the
+/// clip before the per-pixel loops, so a run parked outside its bounds costs two
+/// comparisons per frame no matter how long its text is.
+///
+/// Preconditions: `style.scale >= 1` (the window arithmetic divides by the cell
+/// size) and a non-empty clip. Both callers route through [`validated_glyphs`] and
+/// validated rects, which is what makes the divisions and the sign of the window
+/// arithmetic safe.
+pub(crate) fn draw_glyph_run(
+    frame: &mut Frame,
+    clip: Clip,
+    glyphs: &[[u8; GLYPH_PX]],
+    left: i32,
+    top: i32,
+    style: TextStyle,
+) {
+    debug_assert!(style.scale >= 1, "scale is validated before drawing");
+    debug_assert!(
+        clip.x0 < clip.x1 && clip.y0 < clip.y1,
+        "the clip comes from a validated, non-degenerate rect"
+    );
     let scale = i32::from(style.scale);
-    for (index, rows) in glyphs.iter().enumerate() {
-        let glyph_left = left + index as i32 * GLYPH_PX as i32 * scale;
-        // Entirely off either edge: nothing to draw, and the next glyph may differ.
-        if glyph_left + GLYPH_PX as i32 * scale <= 0 || glyph_left >= i32::from(canvas.width()) {
-            continue;
-        }
+    let cell = GLYPH_PX as i32 * scale;
+    // Entirely outside on either axis: nothing to draw.
+    if top + cell <= clip.y0 || top >= clip.y1 {
+        return;
+    }
+    let run_width = glyphs.len() as i32 * cell;
+    if left + run_width <= clip.x0 || left >= clip.x1 {
+        return;
+    }
+
+    // Only glyphs whose cells intersect the clip horizontally.
+    let first = if left >= clip.x0 {
+        0
+    } else {
+        ((clip.x0 - left) / cell) as usize
+    };
+    let last = ((clip.x1 - left + cell - 1) / cell).min(glyphs.len() as i32) as usize;
+
+    // Vertical extent shared by every glyph in the run, clamped to the clip.
+    let clamp_span =
+        |base: i32, lo: i32, hi: i32| (lo.max(base) - base, hi.min(base + scale) - base);
+
+    for (index, rows) in glyphs.iter().enumerate().take(last).skip(first) {
+        let glyph_left = left + index as i32 * cell;
         for (row, bits) in rows.iter().enumerate() {
+            let y_base = top + row as i32 * scale;
+            let (dy0, dy1) = clamp_span(y_base, clip.y0, clip.y1);
+            if dy0 >= dy1 {
+                continue;
+            }
             for column in 0..GLYPH_PX {
                 if bits & (1 << column) == 0 {
                     continue;
                 }
-                for dy in 0..scale {
-                    for dx in 0..scale {
-                        let x = glyph_left + column as i32 * scale + dx;
-                        let y = top + row as i32 * scale + dy;
-                        if let (Ok(x), Ok(y)) = (u16::try_from(x), u16::try_from(y)) {
-                            // `set` clips silently past the far edges, which is
-                            // exactly what a marquee needs.
+                let x_base = glyph_left + column as i32 * scale;
+                let (dx0, dx1) = clamp_span(x_base, clip.x0, clip.x1);
+                if dx0 >= dx1 {
+                    continue;
+                }
+                for dy in dy0..dy1 {
+                    for dx in dx0..dx1 {
+                        // The clamps prove the coordinates non-negative and inside
+                        // the clip; `set` still guards the canvas edge, so a clip
+                        // wider than the frame clips there rather than writing out
+                        // of bounds.
+                        if let (Ok(x), Ok(y)) =
+                            (u16::try_from(x_base + dx), u16::try_from(y_base + dy))
+                        {
                             frame.set(x, y, style.foreground);
                         }
                     }
@@ -210,14 +275,36 @@ fn compose(
             }
         }
     }
-    frame
 }
 
 /// The font's cell for a character, or the placeholder for one it cannot draw.
-fn glyph_for(ch: char) -> [u8; GLYPH_PX] {
+pub(crate) fn glyph_for(ch: char) -> [u8; GLYPH_PX] {
     BASIC_FONTS
         .get(ch)
         .unwrap_or_else(|| BASIC_FONTS.get('?').expect("the font covers ASCII"))
+}
+
+/// Validate text and scale, resolving the glyph run.
+///
+/// The single gate both rasterizers pass through, so the accepted character count
+/// and scale range cannot drift between the plain-text and layout paths. Checks run
+/// before the glyph vector is allocated, so refused text costs a scan of the string
+/// it arrived in and nothing more.
+pub(crate) fn validated_glyphs(text: &str, scale: u8) -> Result<Vec<[u8; GLYPH_PX]>, TextError> {
+    if text.is_empty() {
+        return Err(TextError::Empty);
+    }
+    let count = text.chars().count();
+    if count > MAX_TEXT_CHARS {
+        return Err(TextError::TooLong {
+            actual: count,
+            limit: MAX_TEXT_CHARS,
+        });
+    }
+    if !(1..=4).contains(&scale) {
+        return Err(TextError::BadScale(scale));
+    }
+    Ok(text.chars().map(glyph_for).collect())
 }
 
 #[cfg(test)]

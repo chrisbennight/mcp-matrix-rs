@@ -38,6 +38,9 @@ pub enum ToolError {
 
     #[error("text rejected: {0}")]
     Text(#[from] matrix_text::TextError),
+
+    #[error("layout rejected: {0}")]
+    Layout(#[from] matrix_text::layout::LayoutError),
 }
 
 impl ToolError {
@@ -49,6 +52,7 @@ impl ToolError {
             Self::InlineTooLarge { .. } => "matrix_inline_too_large",
             Self::InlineMalformed(_) => "matrix_inline_malformed",
             Self::Text(inner) => inner.code(),
+            Self::Layout(inner) => inner.code(),
         }
     }
 }
@@ -57,7 +61,9 @@ impl ToolError {
 /// payload use one contract.
 ///
 /// The shape matches SEP-2631's file object, so adopting that draft later changes how a
-/// `uri` is produced and not what this tool accepts.
+/// `uri` is produced and not what this tool accepts. Unlike the tool parameter structs,
+/// unknown keys are tolerated here: the shape is an external draft's, and a future
+/// revision may add fields an intermediary forwards before this server learns them.
 #[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
 pub struct FileValue {
     /// A `data:` URI for content already at native resolution, or a URI a trusted
@@ -145,6 +151,11 @@ pub struct DeviceReport {
     pub height: u16,
     pub pixels: usize,
     pub reported_fps: u16,
+    /// The fixed rate sequences render and play at, set by the operator. Also the
+    /// ceiling for a layout scroller's `speed_px_s` — the pre-render pacing
+    /// contract for `matrix_show_text_layout`, the way `text_visible_chars` is the
+    /// sizing contract for `matrix_show_text`.
+    pub target_fps: u16,
     pub power_ma: u32,
     pub power_ceiling_ma: u32,
     pub enforces_power_ceiling: bool,
@@ -187,6 +198,7 @@ pub async fn describe_device(engine: &Arc<Engine>) -> Result<DeviceReport, ToolE
         height,
         pixels: engine.canvas.pixels(),
         reported_fps: info.leds.fps,
+        target_fps: engine.target_rate.fps(),
         power_ma: info.leds.power_ma,
         power_ceiling_ma: info.leds.max_power_ma,
         enforces_power_ceiling: info.leds.has_power_ceiling(),
@@ -261,41 +273,34 @@ pub async fn list_assets(engine: &Arc<Engine>) -> Vec<AssetReport> {
         .collect()
 }
 
-/// Rasterize text into a held asset, optionally playing it at once.
+/// The frame budget every text ingest path renders under — the same cap the media
+/// path decodes under, derived from the engine's canvas and target rate.
+fn text_frame_budget(engine: &Arc<Engine>) -> u64 {
+    Limits::default().frame_cap_for_frame_size(engine.target_rate.fps(), engine.canvas.byte_len())
+}
+
+/// Mint, optionally play, then store a rendered text sequence.
 ///
-/// Text does not ride the media path: it carries no container, so there is nothing to
-/// probe or decode, and no subprocess or decode permit is involved.
-pub async fn show_text(
+/// The one place the text tools' asset discipline lives, so the two rasterizing
+/// paths cannot drift apart. Playback starts before the asset is committed to the
+/// store: a failed start — unreachable panel, refused socket — then costs nothing
+/// and evicts nothing. Text always plays looping: a marquee or layout package
+/// repeats until stopped, and a still holds anyway under the panel's realtime
+/// timeout semantics.
+async fn hold_text_asset(
     engine: &Arc<Engine>,
-    text: &str,
+    sequence: matrix_frame::FrameSequence,
+    source_bytes: u64,
     play_now: bool,
 ) -> Result<(AssetReport, Option<String>), ToolError> {
-    let style = matrix_text::TextStyle::default();
-    // The same frame budget the media path decodes under: text obeys the shared
-    // ingest limits, and a message that would outrun them is refused before any
-    // frame exists.
-    let budget = Limits::default()
-        .frame_cap_for_frame_size(engine.target_rate.fps(), engine.canvas.byte_len());
-
-    // Text rendering is ingest — it materializes a full frame sequence just as a
-    // decode does — so it runs under the same aggregate slot. Without it, concurrent
-    // calls could each hold a maximal sequence outside every ceiling while the
-    // decode path stays politely bounded next door.
-    let _slot = engine.acquire_decode_slot().await?;
-    let sequence = matrix_text::render(text, engine.canvas, engine.target_rate, style, budget)?;
-
     let asset = crate::state::Asset {
         handle: engine.mint_asset_handle(),
         sequence,
-        source_bytes: text.len() as u64,
+        source_bytes,
         media_type: "text/plain".into(),
     };
     let report = report_for(&asset);
 
-    // Playback starts before the asset is committed to the store: a failed start —
-    // unreachable panel, refused socket — then costs nothing and evicts nothing.
-    // A marquee loops until stopped; a still holds anyway under the panel's realtime
-    // timeout semantics, so looping is the right default for both shapes.
     let playback = if play_now {
         Some(engine.play_asset(&asset, true).await?)
     } else {
@@ -306,9 +311,320 @@ pub async fn show_text(
     Ok((report, playback))
 }
 
+/// Rasterize text into a held asset, optionally playing it at once.
+///
+/// Text does not ride the media path: it carries no container, so there is nothing
+/// to probe or decode and no subprocess is involved. Rendering still materializes a
+/// full frame sequence just as a decode does, so it runs under the same aggregate
+/// ingest slot — held until the sequence is committed, not just across the render.
+/// The slot is the only aggregate bound on how many maximal sequences exist at
+/// once, and the handoff parks on the device poll for up to the WLED timeout while
+/// holding one; releasing at the render would let sequences pile up behind a slow
+/// panel with nothing left to refuse them.
+pub async fn show_text(
+    engine: &Arc<Engine>,
+    text: &str,
+    play_now: bool,
+) -> Result<(AssetReport, Option<String>), ToolError> {
+    let style = matrix_text::TextStyle::default();
+    let _slot = engine.acquire_decode_slot().await?;
+    let sequence = matrix_text::render(
+        text,
+        engine.canvas,
+        engine.target_rate,
+        style,
+        text_frame_budget(engine),
+    )?;
+    hold_text_asset(engine, sequence, text.len() as u64, play_now).await
+}
+
 /// Characters visible at once on the configured canvas at the default text scale.
 pub fn text_visible_chars(engine: &Arc<Engine>) -> usize {
     matrix_text::visible_chars(engine.canvas, matrix_text::TextStyle::default().scale)
+}
+
+/// A region's bounds on the canvas, in pixels.
+#[derive(Debug, Clone, Copy, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RectParam {
+    pub x: u16,
+    pub y: u16,
+    pub width: u16,
+    pub height: u16,
+}
+
+/// How a region draws its text.
+#[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RegionStyleParam {
+    /// Integer glyph magnification, 1 to 4. Defaults to 2.
+    #[serde(default = "default_region_scale")]
+    #[schemars(range(min = 1, max = 4))]
+    pub scale: u8,
+    /// Text color as `#rrggbb`. Defaults to white.
+    #[serde(default = "default_region_foreground")]
+    pub foreground: String,
+    /// Background painted across the whole rectangle, as `#rrggbb`. Defaults to
+    /// black. A bright background over a large rectangle raises the frame's power
+    /// draw, and the power clamp dims whole frames uniformly.
+    #[serde(default = "default_region_background")]
+    pub background: String,
+}
+
+fn default_region_scale() -> u8 {
+    matrix_text::TextStyle::default().scale
+}
+
+fn default_region_foreground() -> String {
+    "#ffffff".into()
+}
+
+fn default_region_background() -> String {
+    "#000000".into()
+}
+
+impl Default for RegionStyleParam {
+    fn default() -> Self {
+        Self {
+            scale: default_region_scale(),
+            foreground: default_region_foreground(),
+            background: default_region_background(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AlignParam {
+    Left,
+    #[default]
+    Center,
+    Right,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum PathParam {
+    LeftToRight,
+    TopToBottom,
+    TopLeftToBottomRight,
+    BottomLeftToTopRight,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum DirectionParam {
+    #[default]
+    Normal,
+    Reverse,
+}
+
+/// A region's behavior over the package timeline.
+///
+/// Deserialization is stricter than serde's tagged-enum default: a typo'd or
+/// misplaced key inside this object would otherwise be dropped silently and render
+/// the wrong animation with a success response, so the hand-written impl below
+/// flattens the object, refuses unknown keys, and refuses fields that belong to
+/// the other variant.
+#[derive(Debug, Clone, schemars::JsonSchema)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum BehaviorParam {
+    /// Text drawn once, visible in every frame. Must fit its rectangle.
+    Fixed {
+        /// Horizontal placement inside the rectangle. Defaults to center.
+        #[serde(default)]
+        align: AlignParam,
+    },
+    /// Text that starts fully outside one edge, crosses the rectangle, and exits the
+    /// far edge. `reverse` retraces the named path backwards; glyphs stay upright.
+    Scroll {
+        path: PathParam,
+        #[serde(default)]
+        direction: DirectionParam,
+        /// Pixels per second along the dominant axis of travel, sampled into the
+        /// panel's fixed frame rate. At least 1 and at most the panel's target
+        /// frame rate — one pixel per frame — so motion never skips glyph strokes.
+        /// `matrix_describe_device` reports the target rate as `target_fps`.
+        #[schemars(range(min = 1))]
+        speed_px_s: u16,
+    },
+}
+
+/// The flat shape `BehaviorParam` deserializes through. Flattening lets serde's
+/// `deny_unknown_fields` cover the whole object — the internally tagged derive
+/// cannot — and the per-variant checks below catch known fields on the wrong
+/// variant, which the flat shape would otherwise silently accept.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "snake_case")]
+struct BehaviorRaw {
+    #[serde(rename = "type")]
+    kind: BehaviorKind,
+    align: Option<AlignParam>,
+    path: Option<PathParam>,
+    direction: Option<DirectionParam>,
+    speed_px_s: Option<u16>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum BehaviorKind {
+    Fixed,
+    Scroll,
+}
+
+impl<'de> Deserialize<'de> for BehaviorParam {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::Error;
+
+        let raw = BehaviorRaw::deserialize(deserializer)?;
+        match raw.kind {
+            BehaviorKind::Fixed => {
+                if raw.path.is_some() || raw.direction.is_some() || raw.speed_px_s.is_some() {
+                    return Err(D::Error::custom(
+                        "`path`, `direction`, and `speed_px_s` belong to `type: scroll`, \
+                         not `type: fixed`",
+                    ));
+                }
+                Ok(BehaviorParam::Fixed {
+                    align: raw.align.unwrap_or_default(),
+                })
+            }
+            BehaviorKind::Scroll => {
+                if raw.align.is_some() {
+                    return Err(D::Error::custom(
+                        "`align` belongs to `type: fixed`, not `type: scroll`",
+                    ));
+                }
+                let path = raw.path.ok_or_else(|| D::Error::missing_field("path"))?;
+                let speed_px_s = raw
+                    .speed_px_s
+                    .ok_or_else(|| D::Error::missing_field("speed_px_s"))?;
+                Ok(BehaviorParam::Scroll {
+                    path,
+                    direction: raw.direction.unwrap_or_default(),
+                    speed_px_s,
+                })
+            }
+        }
+    }
+}
+
+/// One rectangular text region of a layout.
+#[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RegionParam {
+    pub rect: RectParam,
+    /// Up to 100 characters; anything the font cannot draw becomes a visible `?`.
+    pub text: String,
+    #[serde(default)]
+    pub style: RegionStyleParam,
+    pub behavior: BehaviorParam,
+}
+
+/// Turn wire-shaped regions into the layout engine's typed specs.
+fn layout_specs(
+    regions: &[RegionParam],
+) -> Result<Vec<matrix_text::layout::RegionSpec>, ToolError> {
+    use matrix_text::layout;
+
+    regions
+        .iter()
+        .enumerate()
+        .map(|(index, region)| {
+            // The refusal names the offending region and echoes a bounded prefix
+            // of the submitted value, never the whole string.
+            let color = |value: &str| {
+                layout::parse_color(value).ok_or_else(|| layout::LayoutError::BadColor {
+                    region: index,
+                    color: value.chars().take(24).collect(),
+                })
+            };
+            let style = matrix_text::TextStyle {
+                foreground: color(&region.style.foreground)?,
+                background: color(&region.style.background)?,
+                scale: region.style.scale,
+            };
+            let behavior = match &region.behavior {
+                BehaviorParam::Fixed { align } => layout::RegionBehavior::Fixed {
+                    align: match align {
+                        AlignParam::Left => layout::Align::Left,
+                        AlignParam::Center => layout::Align::Center,
+                        AlignParam::Right => layout::Align::Right,
+                    },
+                },
+                BehaviorParam::Scroll {
+                    path,
+                    direction,
+                    speed_px_s,
+                } => layout::RegionBehavior::Scroll {
+                    path: match path {
+                        PathParam::LeftToRight => layout::ScrollPath::LeftToRight,
+                        PathParam::TopToBottom => layout::ScrollPath::TopToBottom,
+                        PathParam::TopLeftToBottomRight => layout::ScrollPath::TopLeftToBottomRight,
+                        PathParam::BottomLeftToTopRight => layout::ScrollPath::BottomLeftToTopRight,
+                    },
+                    direction: match direction {
+                        DirectionParam::Normal => layout::ScrollDirection::Normal,
+                        DirectionParam::Reverse => layout::ScrollDirection::Reverse,
+                    },
+                    speed_px_s: *speed_px_s,
+                },
+            };
+            Ok(layout::RegionSpec {
+                rect: layout::Rect {
+                    x: region.rect.x,
+                    y: region.rect.y,
+                    width: region.rect.width,
+                    height: region.rect.height,
+                },
+                text: region.text.clone(),
+                style,
+                behavior,
+            })
+        })
+        .collect()
+}
+
+/// Rasterize a multi-region text layout into a held asset, optionally playing it.
+///
+/// Like plain text, a layout does not ride the media path — there is nothing to probe
+/// or decode — but rendering it materializes a full frame sequence, so it runs under
+/// the same ingest slot and frame budget the media path decodes under.
+pub async fn show_text_layout(
+    engine: &Arc<Engine>,
+    regions: &[RegionParam],
+    play_now: bool,
+) -> Result<(AssetReport, Option<String>), ToolError> {
+    // The cheap bounds run before any per-region work and before the ingest slot:
+    // a refused shape never gets a conversion pass allocated for it and never
+    // occupies a permit or a waiter. render_layout re-checks both behind the
+    // typed boundary.
+    if regions.is_empty() {
+        return Err(matrix_text::layout::LayoutError::NoRegions.into());
+    }
+    if regions.len() > matrix_text::layout::MAX_REGIONS {
+        return Err(matrix_text::layout::LayoutError::TooManyRegions {
+            actual: regions.len(),
+            limit: matrix_text::layout::MAX_REGIONS,
+        }
+        .into());
+    }
+
+    let specs = layout_specs(regions)?;
+    let source_bytes: u64 = specs.iter().map(|spec| spec.text.len() as u64).sum();
+    // Held until the sequence is committed, for the reason `show_text` documents:
+    // the slot is the aggregate bound on concurrently-materialized sequences.
+    let _slot = engine.acquire_decode_slot().await?;
+    let sequence = matrix_text::layout::render_layout(
+        &specs,
+        engine.canvas,
+        engine.target_rate,
+        text_frame_budget(engine),
+    )?;
+    hold_text_asset(engine, sequence, source_bytes, play_now).await
 }
 
 pub async fn play(
@@ -455,5 +771,202 @@ mod tests {
             resolve_inline(&value).expect_err("no payload").code(),
             "matrix_inline_malformed"
         );
+    }
+
+    #[test]
+    fn every_wire_string_maps_to_its_own_engine_value() {
+        use matrix_text::layout::{Align, RegionBehavior, ScrollDirection, ScrollPath};
+
+        // The wire contract for this seam is the exact snake_case strings; pin
+        // every variant through the deserializer so a transposition in the match
+        // arms or a rename on the serde side fails here rather than on a panel.
+        let region = |behavior: serde_json::Value| {
+            serde_json::json!({
+                "rect": { "x": 0, "y": 0, "width": 64, "height": 16 },
+                "text": "A",
+                "behavior": behavior
+            })
+        };
+        let spec_for = |behavior: serde_json::Value| {
+            let param: RegionParam = serde_json::from_value(region(behavior)).expect("wire shape");
+            layout_specs(std::slice::from_ref(&param))
+                .expect("converts")
+                .remove(0)
+        };
+
+        for (wire, align) in [
+            ("left", Align::Left),
+            ("center", Align::Center),
+            ("right", Align::Right),
+        ] {
+            let spec = spec_for(serde_json::json!({ "type": "fixed", "align": wire }));
+            assert_eq!(
+                spec.behavior,
+                RegionBehavior::Fixed { align },
+                "align {wire:?}"
+            );
+        }
+
+        let paths = [
+            ("left_to_right", ScrollPath::LeftToRight),
+            ("top_to_bottom", ScrollPath::TopToBottom),
+            ("top_left_to_bottom_right", ScrollPath::TopLeftToBottomRight),
+            ("bottom_left_to_top_right", ScrollPath::BottomLeftToTopRight),
+        ];
+        let directions = [
+            ("normal", ScrollDirection::Normal),
+            ("reverse", ScrollDirection::Reverse),
+        ];
+        for (path_wire, path) in paths {
+            for (direction_wire, direction) in directions {
+                let spec = spec_for(serde_json::json!({
+                    "type": "scroll",
+                    "path": path_wire,
+                    "direction": direction_wire,
+                    "speed_px_s": 10
+                }));
+                assert_eq!(
+                    spec.behavior,
+                    RegionBehavior::Scroll {
+                        path,
+                        direction,
+                        speed_px_s: 10
+                    },
+                    "path {path_wire:?} direction {direction_wire:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn region_style_maps_colors_scale_and_rect_faithfully() {
+        let param: RegionParam = serde_json::from_value(serde_json::json!({
+            "rect": { "x": 3, "y": 5, "width": 40, "height": 20 },
+            "text": "HI",
+            "style": { "scale": 1, "foreground": "#00E5FF", "background": "#101010" },
+            "behavior": { "type": "fixed" }
+        }))
+        .expect("wire shape");
+        let spec = layout_specs(std::slice::from_ref(&param))
+            .expect("converts")
+            .remove(0);
+
+        assert_eq!(
+            (spec.rect.x, spec.rect.y, spec.rect.width, spec.rect.height),
+            (3, 5, 40, 20)
+        );
+        assert_eq!(spec.style.scale, 1);
+        assert_eq!(spec.style.foreground, matrix_frame::Rgb::new(0, 229, 255));
+        assert_eq!(spec.style.background, matrix_frame::Rgb::new(16, 16, 16));
+    }
+
+    #[test]
+    fn a_bad_color_refusal_names_the_region() {
+        let good: RegionParam = serde_json::from_value(serde_json::json!({
+            "rect": { "x": 0, "y": 0, "width": 32, "height": 16 },
+            "text": "A",
+            "behavior": { "type": "fixed" }
+        }))
+        .expect("wire shape");
+        let bad: RegionParam = serde_json::from_value(serde_json::json!({
+            "rect": { "x": 32, "y": 0, "width": 32, "height": 16 },
+            "text": "B",
+            "style": { "foreground": "#nothex" },
+            "behavior": { "type": "fixed" }
+        }))
+        .expect("wire shape");
+
+        let err = layout_specs(&[good, bad]).expect_err("refused");
+        assert_eq!(err.code(), "matrix_layout_bad_color");
+        assert!(
+            err.to_string().contains("region 1"),
+            "the refusal names the offending region: {err}"
+        );
+    }
+
+    #[test]
+    fn the_published_schema_bounds_track_the_engine_limits() {
+        // The wire schema restates engine limits as machine-readable bounds; pinning
+        // them to the constants means a raised cap cannot leave the published schema
+        // advertising the old number to every client.
+        let layout_params =
+            serde_json::to_value(schemars::schema_for!(crate::mcp::ShowTextLayoutParams))
+                .expect("schema serializes");
+        assert_eq!(
+            layout_params["properties"]["regions"]["maxItems"],
+            serde_json::json!(matrix_text::layout::MAX_REGIONS),
+            "the regions bound tracks MAX_REGIONS"
+        );
+        assert_eq!(
+            layout_params["properties"]["regions"]["minItems"],
+            serde_json::json!(1)
+        );
+
+        // The scale range mirrors the rasterizer's validated 1..=4; matrix-text's
+        // own tests pin the refusal at both ends of the same range.
+        let style = serde_json::to_value(schemars::schema_for!(RegionStyleParam))
+            .expect("schema serializes");
+        assert_eq!(
+            style["properties"]["scale"]["minimum"],
+            serde_json::json!(1)
+        );
+        assert_eq!(
+            style["properties"]["scale"]["maximum"],
+            serde_json::json!(4)
+        );
+    }
+
+    #[test]
+    fn an_unknown_or_misplaced_region_field_is_refused_rather_than_ignored() {
+        // A typo'd or misplaced key must not silently render the wrong layout:
+        // every level of the region object refuses what it does not recognise,
+        // including the behavior object, whose hand-written deserializer also
+        // refuses known fields on the wrong variant.
+        let region = |style: serde_json::Value, behavior: serde_json::Value| {
+            serde_json::json!({
+                "rect": { "x": 0, "y": 0, "width": 32, "height": 16 },
+                "text": "A",
+                "style": style,
+                "behavior": behavior
+            })
+        };
+        let default_style = serde_json::json!({});
+        let cases = [
+            (
+                "misspelled style key",
+                region(
+                    serde_json::json!({ "colour": "#ff0000" }),
+                    serde_json::json!({ "type": "fixed" }),
+                ),
+            ),
+            (
+                "misspelled behavior key",
+                region(
+                    default_style.clone(),
+                    serde_json::json!({ "type": "scroll", "path": "left_to_right",
+                                        "directon": "reverse", "speed_px_s": 10 }),
+                ),
+            ),
+            (
+                "scroll fields on a fixed region",
+                region(
+                    default_style.clone(),
+                    serde_json::json!({ "type": "fixed", "path": "left_to_right",
+                                        "speed_px_s": 10 }),
+                ),
+            ),
+            (
+                "align on a scrolling region",
+                region(
+                    default_style.clone(),
+                    serde_json::json!({ "type": "scroll", "path": "left_to_right",
+                                        "align": "right", "speed_px_s": 10 }),
+                ),
+            ),
+        ];
+        for (case, value) in cases {
+            let result: Result<RegionParam, _> = serde_json::from_value(value);
+            assert!(result.is_err(), "{case} must be refused");
+        }
     }
 }

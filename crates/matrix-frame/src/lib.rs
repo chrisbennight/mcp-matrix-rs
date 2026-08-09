@@ -97,6 +97,9 @@ impl Canvas {
     ///
     /// Row-major matches both the DDP payload layout and the panel's own pixel order,
     /// so no remapping happens between here and the wire.
+    // Inlined across crates: rasterizers call this once per lit pixel, and without
+    // the hint the workspace's default profile keeps it an outlined call.
+    #[inline]
     pub fn offset(&self, x: u16, y: u16) -> Option<usize> {
         if x >= self.width || y >= self.height {
             return None;
@@ -199,6 +202,9 @@ impl Frame {
     /// Set one pixel. Out-of-bounds coordinates are ignored rather than panicking:
     /// drawing routines clip against the canvas edge constantly and a fallible setter
     /// would push that check into every caller.
+    // Inlined across crates: this is the rasterizers' per-pixel write, and without
+    // the hint the workspace's default profile keeps it an outlined call.
+    #[inline]
     pub fn set(&mut self, x: u16, y: u16, color: Rgb) {
         let Some(offset) = self.canvas.offset(x, y) else {
             return;

@@ -4,6 +4,7 @@ matrix_play
 matrix_power
 matrix_set_brightness
 matrix_show_text
+matrix_show_text_layout
 matrix_status
 matrix_stop
 matrix_submit_asset

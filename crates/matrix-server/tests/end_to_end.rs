@@ -559,6 +559,195 @@ async fn text_shown_over_the_wire_scrolls_onto_the_panel() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_text_layout_with_fixed_and_scrolling_regions_plays_over_the_wire() {
+    let panel = UdpSocket::bind("127.0.0.1:0").await.expect("bind panel");
+    let panel_addr = panel.local_addr().expect("panel addr");
+    let base = fake_panel(PANEL_INFO);
+
+    let engine = Engine::new(
+        canvas(),
+        Rate::new(25).expect("valid"),
+        WledClient::new(base, Duration::from_secs(2)).expect("valid base"),
+        panel_addr,
+    );
+    let server = WireServer::start(
+        engine,
+        MediaBinaries {
+            ffmpeg: "unused".into(),
+            ffprobe: "unused".into(),
+        },
+    )
+    .await;
+
+    // A chyron: a fixed headline on top, a ticker crossing the bottom rows.
+    let shown = server
+        .call_tool(
+            "matrix_show_text_layout",
+            serde_json::json!({
+                "regions": [
+                    {
+                        "rect": { "x": 0, "y": 0, "width": 64, "height": 16 },
+                        "text": "SHIP",
+                        "behavior": { "type": "fixed", "align": "center" }
+                    },
+                    {
+                        "rect": { "x": 0, "y": 52, "width": 64, "height": 12 },
+                        "text": "BUILD GREEN | TESTS PASS",
+                        "style": { "scale": 1 },
+                        "behavior": {
+                            "type": "scroll",
+                            "path": "left_to_right",
+                            "direction": "reverse",
+                            "speed_px_s": 25
+                        }
+                    }
+                ]
+            }),
+        )
+        .await;
+    let payload = tool_payload(&shown);
+    let frames = payload["asset"]["frames"].as_u64().expect("frame count");
+    assert!(frames > 1, "a package with a scroller animates: {payload}");
+    assert_eq!(payload["regions"], 2);
+    let playback = payload["playback"]
+        .as_str()
+        .expect("played by default")
+        .to_string();
+
+    // The fixed headline is lit in every frame and each region's pixels stay inside
+    // its own rectangle, so any complete frame on the wire must carry light in the
+    // headline's rows and nowhere outside the two regions. Reassemble one frame by
+    // declared offset, anchored on an offset-zero packet and closed by the sender's
+    // push flag, so a dropped datagram costs one frame rather than splicing two.
+    let frame_bytes = canvas().byte_len();
+    let mut reassembled = vec![0u8; frame_bytes];
+    let mut anchored = false;
+    let mut covered = 0usize;
+    let mut buf = vec![0u8; 2048];
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "a complete frame must arrive within ten seconds"
+        );
+        let (n, _) = tokio::time::timeout(Duration::from_secs(5), panel.recv_from(&mut buf))
+            .await
+            .expect("frames are flowing")
+            .expect("recv");
+        let offset = u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]) as usize;
+        let len = u16::from_be_bytes([buf[8], buf[9]]) as usize;
+        assert_eq!(
+            len,
+            n - DDP_HEADER_LEN,
+            "declared length matches the datagram"
+        );
+        assert!(
+            offset + len <= frame_bytes,
+            "a declared span stays inside one frame"
+        );
+        if offset == 0 {
+            anchored = true;
+            covered = 0;
+        } else if !anchored {
+            continue;
+        }
+        reassembled[offset..offset + len].copy_from_slice(&buf[DDP_HEADER_LEN..n]);
+        covered += len;
+        // The sender marks a frame's final packet with the DDP push flag.
+        if buf[0] & 0x01 != 0 {
+            if covered == frame_bytes {
+                break;
+            }
+            // A datagram went missing mid-frame; re-anchor on the next frame.
+            anchored = false;
+        }
+    }
+
+    let lit_rows: Vec<usize> = reassembled
+        .chunks(3)
+        .enumerate()
+        .filter(|(_, px)| px.iter().any(|&b| b > 0))
+        .map(|(i, _)| i / 64)
+        .collect();
+    assert!(
+        lit_rows.iter().any(|&y| y < 16),
+        "the fixed headline is lit in every frame"
+    );
+    assert!(
+        lit_rows.iter().all(|&y| y < 16 || (52..64).contains(&y)),
+        "light stays inside the two regions' rows: {lit_rows:?}"
+    );
+
+    let stopped = server
+        .call_tool("matrix_stop", serde_json::json!({ "playback": playback }))
+        .await;
+    assert_eq!(
+        tool_payload(&stopped)["stopped"].as_str(),
+        Some(playback.as_str())
+    );
+
+    // Stopping must end the stream, not merely answer the call.
+    let drain_deadline = tokio::time::Instant::now() + Duration::from_millis(500);
+    while tokio::time::Instant::now() < drain_deadline {
+        if tokio::time::timeout(Duration::from_millis(100), panel.recv_from(&mut buf))
+            .await
+            .is_err()
+        {
+            break;
+        }
+    }
+    let after_stop =
+        tokio::time::timeout(Duration::from_millis(750), panel.recv_from(&mut buf)).await;
+    assert!(after_stop.is_err(), "no frame after stopping the layout");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_layout_refusal_crosses_the_wire_with_its_code_intact() {
+    let base = fake_panel(PANEL_INFO);
+    let engine = Engine::new(
+        canvas(),
+        Rate::new(25).expect("valid"),
+        WledClient::new(base, Duration::from_secs(2)).expect("valid base"),
+        "127.0.0.1:4048".parse().expect("addr"),
+    );
+    let server = WireServer::start(
+        engine,
+        MediaBinaries {
+            ffmpeg: "unused".into(),
+            ffprobe: "unused".into(),
+        },
+    )
+    .await;
+
+    let response = server
+        .call_tool(
+            "matrix_show_text_layout",
+            serde_json::json!({
+                "regions": [
+                    {
+                        "rect": { "x": 0, "y": 0, "width": 32, "height": 16 },
+                        "text": "A",
+                        "behavior": { "type": "fixed" }
+                    },
+                    {
+                        "rect": { "x": 16, "y": 8, "width": 32, "height": 16 },
+                        "text": "B",
+                        "behavior": { "type": "fixed" }
+                    }
+                ]
+            }),
+        )
+        .await;
+
+    let error = &response["error"];
+    assert_eq!(
+        error["code"], -32050,
+        "implementation-defined code: {response}"
+    );
+    assert_eq!(error["data"]["code"], "matrix_layout_overlap");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn the_host_allowlist_admits_the_dialed_authority_and_refuses_others() {
     let base = fake_panel(PANEL_INFO);
     let engine = Engine::new(

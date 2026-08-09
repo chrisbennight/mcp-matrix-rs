@@ -28,7 +28,8 @@ and their reasoning. Read both before changing an architectural boundary.
   out of process under a deadline and resource ceilings.
 - `crates/matrix-playout` owns rate adaptation, power clamping, and paced frame sends.
   `Playout` is the only frame-send path.
-- `crates/matrix-text` rasterizes text into the same frame representation.
+- `crates/matrix-text` rasterizes text into the same frame representation, including
+  multi-region layouts of fixed and scrolling text.
 - `crates/matrix-server` owns the binary, MCP transport, tool dispatch, and shared
   engine state.
 
