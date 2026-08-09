@@ -39,10 +39,18 @@ advertised tool names against it.
 ## Commands
 
 ```sh
+scripts/verify.sh
+```
+
+runs every verification gate — format, clippy, tests, image build, and the image
+smoke — as one argument-free command. The individual gates it runs:
+
+```sh
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 cargo test --workspace --all-features --locked
-docker build -t mcp-matrix-rs:local .
+docker build -t mcp-matrix-rs:verify .
+smoke/image.sh mcp-matrix-rs:verify
 ```
 
 CI targets Linux/amd64. Unit and integration tests must use loopback fakes and never
@@ -94,6 +102,9 @@ panel is supported without verified electrical and protocol evidence.
   authorized those actions.
 - Run the relevant verification commands and read their explicit successful exit status
   before each commit or push.
+- In a PR description's verification section, cite the commands exactly as executed —
+  `scripts/verify.sh` for a full run — never a reconstructed or abbreviated command
+  line.
 - Keep pull-request descriptions factual: design goal, externally observable outcomes,
   implementation narrative, verification, risks, and non-goals.
 
