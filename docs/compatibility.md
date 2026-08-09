@@ -34,6 +34,7 @@ smoke test.
 
 ## MCP clients
 
-Clients must support MCP `2026-07-28` over Streamable HTTP and connect to `/mcp`. The
+Clients must support MCP `2026-07-28` and either connect to `/mcp` over Streamable
+HTTP or spawn the binary with `--stdio` and speak over its stdin and stdout. The
 server is stateless at the transport layer; asset and playback handles are ordinary tool
 arguments and become invalid after a server restart.

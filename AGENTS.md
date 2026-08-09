@@ -10,7 +10,8 @@ panel over DDP.
 
 - Repository: `https://github.com/chrisbennight/mcp-matrix-rs`
 - Verified hardware: Apollo Automation M-1, 64x64 RGB HUB75, WLED firmware
-- Protocol: MCP `2026-07-28` over Streamable HTTP at `/mcp`
+- Protocol: MCP `2026-07-28` over Streamable HTTP at `/mcp`, or over stdio via
+  `--stdio` for a single spawning client
 - Trust model: the application has no built-in authentication; operators define the
   trusted boundary
 

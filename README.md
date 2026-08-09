@@ -77,7 +77,8 @@ An alert screen readable from across the room: incident header and count, affect
 
 ## What works
 
-- MCP `2026-07-28` over Streamable HTTP at `/mcp`
+- MCP `2026-07-28` over Streamable HTTP at `/mcp`, or over stdio (`--stdio`) for
+  clients without remote MCP support
 - centered and scrolling text; input is capped at 100 characters, and long marquees
   must also fit the configured frame budget
 - multi-region text layouts: up to 16 non-overlapping rectangles of fixed or
@@ -117,7 +118,16 @@ The server has no built-in authentication. Do not expose it directly to the inte
 or an untrusted LAN. See [Deployment and security](docs/deployment.md) before changing
 the listener or published-port address.
 
+If your MCP client cannot connect to a remote server at all, skip the container and
+run the binary over stdio instead; see [stdio](#stdio) under Usage.
+
 ## Usage
+
+The server speaks two transports: Streamable HTTP (the default, one shared server for
+any number of clients) and stdio (`--stdio`, for clients that spawn a local process
+instead of connecting to a URL). The tool surface is identical on both.
+
+### Streamable HTTP
 
 Point any MCP client that speaks Streamable HTTP at `http://127.0.0.1:8080/mcp`.
 For Claude Code:
@@ -126,7 +136,14 @@ For Claude Code:
 claude mcp add --transport http matrix http://127.0.0.1:8080/mcp
 ```
 
-or in a client's JSON configuration:
+For Codex, in `~/.codex/config.toml`:
+
+```toml
+[mcp_servers.matrix]
+url = "http://127.0.0.1:8080/mcp"
+```
+
+or in a client's generic JSON configuration:
 
 ```json
 {
@@ -135,6 +152,43 @@ or in a client's JSON configuration:
   }
 }
 ```
+
+### stdio
+
+Build or install the `matrix-server` binary on the client machine, then register it as
+a spawned server. The client owns the process: it starts the server on demand and the
+server exits when the client closes the pipe. Each stdio process assumes it is the
+panel's only driver, so run one stdio client per panel and do not mix it with a
+concurrently running HTTP instance.
+
+For Claude Code:
+
+```sh
+claude mcp add matrix \
+  --env MATRIX_WLED_URL=http://192.0.2.10 \
+  --env MATRIX_DDP_ADDR=192.0.2.10:4048 \
+  -- matrix-server --stdio
+```
+
+For Codex, in `~/.codex/config.toml`:
+
+```toml
+[mcp_servers.matrix]
+command = "matrix-server"
+args = ["--stdio"]
+
+[mcp_servers.matrix.env]
+MATRIX_WLED_URL = "http://192.0.2.10"
+MATRIX_DDP_ADDR = "192.0.2.10:4048"
+```
+
+Replace the documentation-only `192.0.2.10` with your panel's address. Every setting
+in the [configuration reference](docs/configuration.md) works as an environment
+variable or a flag; `MATRIX_HTTP_ADDR` and `MATRIX_ALLOWED_HOSTS` are HTTP-only and
+ignored under `--stdio`, and combining `--stdio` with `--healthcheck` is rejected at
+startup. Logs go to stderr, so client transcripts stay clean JSON-RPC.
+
+### A typical session
 
 A typical session from the client:
 

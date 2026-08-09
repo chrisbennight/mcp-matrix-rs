@@ -1,8 +1,9 @@
 //! Binary entry point.
 //!
-//! Serves MCP `2026-07-28` over Streamable HTTP at `/mcp`, with `/healthz` for liveness.
-//! Stateless: the transport builds a handler per request, so the engine lives behind an
-//! `Arc` the factory clones.
+//! Serves MCP `2026-07-28` over Streamable HTTP at `/mcp`, with `/healthz` for liveness,
+//! or over stdio for a single spawning client when `--stdio` is set. Stateless: the HTTP
+//! transport builds a handler per request, so the engine lives behind an `Arc` the
+//! factory clones; the stdio session holds one handler for its lifetime.
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -66,6 +67,13 @@ struct Args {
     /// Probe a running instance on loopback and exit 0 or 1.
     #[arg(long)]
     healthcheck: bool,
+
+    /// Serve MCP over stdio for the single client that spawned this process instead of
+    /// listening on HTTP. `--listen` and `--allowed-hosts` are ignored in this mode.
+    /// Combining it with `--healthcheck` is rejected: there is no HTTP endpoint to
+    /// probe, and silently probing one anyway would report the wrong process's health.
+    #[arg(long, env = "MATRIX_STDIO", conflicts_with = "healthcheck")]
+    stdio: bool,
 }
 
 #[tokio::main]
@@ -120,6 +128,28 @@ async fn main() -> Result<()> {
         ffprobe: args.ffprobe_bin.clone(),
     };
 
+    if args.stdio {
+        use rmcp::ServiceExt;
+
+        tracing::info!(
+            wled = %args.wled_url,
+            ddp = %args.ddp_addr,
+            canvas = format!("{}x{}", args.width, args.height),
+            target_fps = args.target_fps,
+            "matrix-server ready (stdio)"
+        );
+
+        // The spawning client owns the process lifetime: when it closes stdin the
+        // session ends, this returns, and process exit stops the device poller. WLED's
+        // realtime timeout then returns the panel to its ambient state.
+        let service = matrix_server::mcp::MatrixHandler::new(engine, binaries)
+            .serve(rmcp::transport::stdio())
+            .await
+            .context("starting stdio transport")?;
+        service.waiting().await.context("stdio session")?;
+        return Ok(());
+    }
+
     let app = matrix_server::router(engine.clone(), binaries, args.allowed_hosts.clone());
 
     let listener = tokio::net::TcpListener::bind(args.listen)
@@ -158,5 +188,45 @@ mod tests {
             .collect();
 
         assert_eq!(defaults, [Some("127.0.0.1:8080")]);
+    }
+
+    #[test]
+    fn stdio_flag_defaults_off_and_binds_env() {
+        let command = Args::command();
+        let stdio = command
+            .get_arguments()
+            .find(|argument| argument.get_id() == "stdio")
+            .expect("stdio argument");
+
+        assert_eq!(
+            stdio.get_env().and_then(|env| env.to_str()),
+            Some("MATRIX_STDIO")
+        );
+
+        let args = Args::try_parse_from([
+            "matrix-server",
+            "--wled-url",
+            "http://192.0.2.10",
+            "--ddp-addr",
+            "192.0.2.10:4048",
+        ])
+        .expect("parse without --stdio");
+        assert!(!args.stdio);
+    }
+
+    #[test]
+    fn stdio_rejects_healthcheck() {
+        let result = Args::try_parse_from([
+            "matrix-server",
+            "--stdio",
+            "--healthcheck",
+            "--wled-url",
+            "http://192.0.2.10",
+            "--ddp-addr",
+            "192.0.2.10:4048",
+        ]);
+
+        let error = result.expect_err("--stdio with --healthcheck must be refused");
+        assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
     }
 }

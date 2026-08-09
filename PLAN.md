@@ -7,7 +7,8 @@ design choices lives in [`DECISIONS.md`](DECISIONS.md).
 
 An MCP upstream that renders caller-supplied media to a WLED LED matrix in realtime.
 Text, stills, GIFs, and video go in; frames go out over DDP. Clients connect directly
-over Streamable HTTP or through a trusted intermediary chosen by the operator.
+over Streamable HTTP, spawn the binary over stdio, or go through a trusted
+intermediary chosen by the operator.
 
 ## Architecture
 
