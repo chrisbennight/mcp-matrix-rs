@@ -62,8 +62,9 @@ serving. They do not prove the panel is reachable. Use `matrix_describe_device` 
 device readiness check and verify the reported dimensions, frame rate, and power ceiling
 before first playback.
 
-A stdio instance has no liveness endpoint; the spawning client observes process health
-directly, and `matrix_describe_device` remains the device readiness check.
+A stdio instance has no liveness endpoint, and `--stdio` combined with `--healthcheck`
+is rejected at startup; the spawning client observes process health directly, and
+`matrix_describe_device` remains the device readiness check.
 
 The server keeps assets only in memory. Restarting it clears assets and playback
 handles; WLED's realtime timeout then restores ambient behavior.

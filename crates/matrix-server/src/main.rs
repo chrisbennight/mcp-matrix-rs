@@ -69,9 +69,10 @@ struct Args {
     healthcheck: bool,
 
     /// Serve MCP over stdio for the single client that spawned this process instead of
-    /// listening on HTTP. `--listen`, `--allowed-hosts`, and `--healthcheck` do not
-    /// apply in this mode.
-    #[arg(long, env = "MATRIX_STDIO")]
+    /// listening on HTTP. `--listen` and `--allowed-hosts` are ignored in this mode.
+    /// Combining it with `--healthcheck` is rejected: there is no HTTP endpoint to
+    /// probe, and silently probing one anyway would report the wrong process's health.
+    #[arg(long, env = "MATRIX_STDIO", conflicts_with = "healthcheck")]
     stdio: bool,
 }
 
@@ -211,5 +212,21 @@ mod tests {
         ])
         .expect("parse without --stdio");
         assert!(!args.stdio);
+    }
+
+    #[test]
+    fn stdio_rejects_healthcheck() {
+        let result = Args::try_parse_from([
+            "matrix-server",
+            "--stdio",
+            "--healthcheck",
+            "--wled-url",
+            "http://192.0.2.10",
+            "--ddp-addr",
+            "192.0.2.10:4048",
+        ]);
+
+        let error = result.expect_err("--stdio with --healthcheck must be refused");
+        assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
     }
 }

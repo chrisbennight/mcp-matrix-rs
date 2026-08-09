@@ -184,9 +184,9 @@ MATRIX_DDP_ADDR = "192.0.2.10:4048"
 
 Replace the documentation-only `192.0.2.10` with your panel's address. Every setting
 in the [configuration reference](docs/configuration.md) works as an environment
-variable or a flag; `MATRIX_HTTP_ADDR`, `MATRIX_ALLOWED_HOSTS`, and `--healthcheck`
-are HTTP-only and ignored under `--stdio`. Logs go to stderr, so client transcripts
-stay clean JSON-RPC.
+variable or a flag; `MATRIX_HTTP_ADDR` and `MATRIX_ALLOWED_HOSTS` are HTTP-only and
+ignored under `--stdio`, and combining `--stdio` with `--healthcheck` is rejected at
+startup. Logs go to stderr, so client transcripts stay clean JSON-RPC.
 
 ### A typical session
 

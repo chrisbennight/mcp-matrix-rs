@@ -11,8 +11,8 @@ All notable changes to this project are documented in this file. The format foll
 - stdio transport: `matrix-server --stdio` (or `MATRIX_STDIO=1`) serves MCP over
   stdin/stdout for the single client that spawned the process, for MCP clients
   without remote-server support. The tool catalog is identical to the Streamable
-  HTTP transport; `MATRIX_HTTP_ADDR`, `MATRIX_ALLOWED_HOSTS`, and `--healthcheck`
-  do not apply in this mode.
+  HTTP transport; `MATRIX_HTTP_ADDR` and `MATRIX_ALLOWED_HOSTS` are ignored in this
+  mode, and combining `--stdio` with `--healthcheck` is rejected at startup.
 
 ## [0.2.0] - 2026-08-09
 

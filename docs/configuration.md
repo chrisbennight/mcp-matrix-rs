@@ -29,9 +29,11 @@ authority through which an MCP client reaches the service, without a URL scheme.
 `/healthz` liveness endpoint is intentionally outside this check.
 
 With `MATRIX_STDIO` (or `--stdio`) set, the server speaks MCP over its own stdin and
-stdout for the one client that spawned it, and `MATRIX_HTTP_ADDR`,
-`MATRIX_ALLOWED_HOSTS`, and `--healthcheck` do not apply. All logging goes to stderr
-in both modes, so stdout stays valid JSON-RPC.
+stdout for the one client that spawned it. `MATRIX_HTTP_ADDR` and
+`MATRIX_ALLOWED_HOSTS` are ignored, and combining the flag with `--healthcheck` is
+rejected: there is no HTTP endpoint to probe, and silently probing one anyway would
+report the wrong process's health. All logging goes to stderr in both modes, so
+stdout stays valid JSON-RPC.
 
 The container pins FFmpeg and ffprobe to `/usr/bin`. Override their paths only when
 running the standalone binary with a deliberately selected installation.
