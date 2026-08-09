@@ -447,6 +447,17 @@ pub enum BehaviorParam {
         /// `matrix_describe_device` reports the target rate as `target_fps`.
         #[schemars(range(min = 1))]
         speed_px_s: u16,
+        /// `false` (the default) crosses once and parks off-screen for the rest of
+        /// the package. `true` re-enters for as many evenly spaced crossings as fit
+        /// the package, so the region stays animated for the whole loop.
+        #[serde(default)]
+        repeat: bool,
+        /// Fraction of this region's cycle, at least 0 and below 1, by which its
+        /// timeline starts advanced — regions with different phases enter at
+        /// different moments instead of all together. Requires `repeat: true`.
+        #[serde(default)]
+        #[schemars(range(min = 0.0, max = 0.999))]
+        phase: f64,
     },
 }
 
@@ -463,6 +474,8 @@ struct BehaviorRaw {
     path: Option<PathParam>,
     direction: Option<DirectionParam>,
     speed_px_s: Option<u16>,
+    repeat: Option<bool>,
+    phase: Option<f64>,
 }
 
 #[derive(Deserialize)]
@@ -482,10 +495,15 @@ impl<'de> Deserialize<'de> for BehaviorParam {
         let raw = BehaviorRaw::deserialize(deserializer)?;
         match raw.kind {
             BehaviorKind::Fixed => {
-                if raw.path.is_some() || raw.direction.is_some() || raw.speed_px_s.is_some() {
+                if raw.path.is_some()
+                    || raw.direction.is_some()
+                    || raw.speed_px_s.is_some()
+                    || raw.repeat.is_some()
+                    || raw.phase.is_some()
+                {
                     return Err(D::Error::custom(
-                        "`path`, `direction`, and `speed_px_s` belong to `type: scroll`, \
-                         not `type: fixed`",
+                        "`path`, `direction`, `speed_px_s`, `repeat`, and `phase` belong \
+                         to `type: scroll`, not `type: fixed`",
                     ));
                 }
                 Ok(BehaviorParam::Fixed {
@@ -502,10 +520,23 @@ impl<'de> Deserialize<'de> for BehaviorParam {
                 let speed_px_s = raw
                     .speed_px_s
                     .ok_or_else(|| D::Error::missing_field("speed_px_s"))?;
+                let repeat = raw.repeat.unwrap_or(false);
+                if raw.phase.is_some() && !repeat {
+                    return Err(D::Error::custom(
+                        "`phase` requires `repeat: true`: a single crossing has no \
+                         cycle to offset",
+                    ));
+                }
+                let phase = raw.phase.unwrap_or(0.0);
+                if !(0.0..1.0).contains(&phase) {
+                    return Err(D::Error::custom("`phase` must be at least 0 and below 1"));
+                }
                 Ok(BehaviorParam::Scroll {
                     path,
                     direction: raw.direction.unwrap_or_default(),
                     speed_px_s,
+                    repeat,
+                    phase,
                 })
             }
         }
@@ -559,6 +590,8 @@ fn layout_specs(
                     path,
                     direction,
                     speed_px_s,
+                    repeat,
+                    phase,
                 } => layout::RegionBehavior::Scroll {
                     path: match path {
                         PathParam::LeftToRight => layout::ScrollPath::LeftToRight,
@@ -571,6 +604,15 @@ fn layout_specs(
                         DirectionParam::Reverse => layout::ScrollDirection::Reverse,
                     },
                     speed_px_s: *speed_px_s,
+                    cadence: if *repeat {
+                        layout::Cadence::Repeat {
+                            // Deserialization bounds phase below 1, so the rounded
+                            // thousandths stay within the engine's 0..=999 window.
+                            phase_per_mille: (phase * 1000.0).round().min(999.0) as u16,
+                        }
+                    } else {
+                        layout::Cadence::Once
+                    },
                 },
             };
             Ok(layout::RegionSpec {
@@ -775,7 +817,7 @@ mod tests {
 
     #[test]
     fn every_wire_string_maps_to_its_own_engine_value() {
-        use matrix_text::layout::{Align, RegionBehavior, ScrollDirection, ScrollPath};
+        use matrix_text::layout::{Align, Cadence, RegionBehavior, ScrollDirection, ScrollPath};
 
         // The wire contract for this seam is the exact snake_case strings; pin
         // every variant through the deserializer so a transposition in the match
@@ -830,12 +872,69 @@ mod tests {
                     RegionBehavior::Scroll {
                         path,
                         direction,
-                        speed_px_s: 10
+                        speed_px_s: 10,
+                        cadence: Cadence::Once,
                     },
                     "path {path_wire:?} direction {direction_wire:?}"
                 );
             }
         }
+
+        let spec = spec_for(serde_json::json!({
+            "type": "scroll",
+            "path": "left_to_right",
+            "speed_px_s": 10,
+            "repeat": true,
+            "phase": 0.25
+        }));
+        assert_eq!(
+            spec.behavior,
+            RegionBehavior::Scroll {
+                path: ScrollPath::LeftToRight,
+                direction: ScrollDirection::Normal,
+                speed_px_s: 10,
+                cadence: Cadence::Repeat {
+                    phase_per_mille: 250
+                },
+            },
+        );
+    }
+
+    #[test]
+    fn cadence_fields_on_the_wrong_shape_are_refused() {
+        let parse = |behavior: serde_json::Value| {
+            serde_json::from_value::<RegionParam>(serde_json::json!({
+                "rect": { "x": 0, "y": 0, "width": 64, "height": 16 },
+                "text": "A",
+                "behavior": behavior
+            }))
+        };
+
+        // A phase with nothing repeating has no cycle to offset.
+        let err = parse(serde_json::json!({
+            "type": "scroll",
+            "path": "left_to_right",
+            "speed_px_s": 10,
+            "phase": 0.5
+        }))
+        .expect_err("phase without repeat");
+        assert!(err.to_string().contains("requires `repeat: true`"), "{err}");
+
+        // Cadence belongs to scrollers, not fixed text.
+        let err = parse(serde_json::json!({ "type": "fixed", "repeat": true }))
+            .expect_err("repeat on fixed");
+        assert!(err.to_string().contains("`type: scroll`"), "{err}");
+
+        // A full cycle of phase is the same as none; refuse rather than wrap.
+        let err = parse(serde_json::json!({
+            "type": "scroll",
+            "path": "left_to_right",
+            "speed_px_s": 10,
+            "repeat": true,
+            "phase": 1.0
+        }))
+        .expect_err("phase at 1");
+        assert!(err.to_string().contains("below 1"), "{err}");
     }
 
     #[test]

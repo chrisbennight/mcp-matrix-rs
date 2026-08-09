@@ -5,13 +5,16 @@
 //! from any other sequence: scheduling and playout never learn that the frames carry a
 //! layout, and the whole package materializes here before playout sees a single frame.
 //!
-//! Every scroller starts at frame zero fully outside its entry edge, crosses its
-//! rectangle, and exits completely. The longest scroller sets the package length; a
-//! shorter one parks outside its destination edge for the remainder, so looping the
-//! package restarts every region together. Because both endpoints are fully outside,
-//! a looped package shows one blank beat — the exited final frame followed by the
-//! not-yet-entered first frame — at each wrap, which is what makes the restart
-//! unambiguous rather than a mid-glyph jump.
+//! Every scroller starts fully outside its entry edge, crosses its rectangle, and
+//! exits completely. The longest single crossing sets the package length. A
+//! [`Cadence::Once`] scroller crosses at frame zero and then parks outside its
+//! destination edge for the remainder; because both endpoints are fully outside, its
+//! looped restart is a blank beat rather than a mid-glyph jump. A [`Cadence::Repeat`]
+//! scroller instead re-enters for as many evenly spaced crossings as fit the package
+//! — always a whole number of cycles, so the looped package stays seamless — and its
+//! phase shifts where in its cycle frame zero falls. Regions with different cycle
+//! lengths and phases drift against each other, which is what makes a composition
+//! read as independently looping even though it is one bounded sequence.
 
 use crate::{Clip, GLYPH_PX, TextError, TextStyle, draw_glyph_run, validated_glyphs};
 use matrix_frame::{Canvas, Frame, FrameError, FrameSequence, Rate, Rgb};
@@ -58,6 +61,25 @@ pub enum ScrollDirection {
     Reverse,
 }
 
+/// How a scroller occupies the package timeline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Cadence {
+    /// One crossing starting at frame zero; afterwards the scroller parks outside
+    /// its destination edge for the rest of the package.
+    #[default]
+    Once,
+    /// As many evenly spaced crossings as fit the package — `floor(package /
+    /// crossing)`, never fewer than one — so the package always holds whole cycles
+    /// and looping it never jumps mid-glyph. The idle gap closing each cycle is
+    /// shorter than one crossing divided by the cycle count.
+    Repeat {
+        /// Fraction of this region's cycle, in thousandths (0 through 999), by which
+        /// its timeline starts advanced: regions enter at different moments instead
+        /// of all together at frame zero.
+        phase_per_mille: u16,
+    },
+}
+
 /// How a region's text behaves over the package timeline.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RegionBehavior {
@@ -77,6 +99,7 @@ pub enum RegionBehavior {
         path: ScrollPath,
         direction: ScrollDirection,
         speed_px_s: u16,
+        cadence: Cadence,
     },
 }
 
@@ -124,6 +147,9 @@ pub enum LayoutError {
         limit: u16,
     },
 
+    #[error("region {region}: phase {phase} is outside 0..=999 thousandths of a cycle")]
+    BadPhase { region: usize, phase: u16 },
+
     #[error("regions {first} and {second} overlap")]
     Overlap { first: usize, second: usize },
 
@@ -146,6 +172,7 @@ impl LayoutError {
             Self::FixedOverflow { .. } => "matrix_layout_fixed_overflow",
             Self::ScrollOverflow { .. } => "matrix_layout_scroll_overflow",
             Self::BadSpeed { .. } => "matrix_layout_bad_speed",
+            Self::BadPhase { .. } => "matrix_layout_bad_phase",
             Self::Overlap { .. } => "matrix_layout_overlap",
             Self::OverBudget { .. } => "matrix_layout_over_budget",
             Self::Frame(inner) => inner.code(),
@@ -199,6 +226,7 @@ enum PreparedKind {
         frames: u64,
         speed: i64,
         reverse: bool,
+        cadence: Cadence,
     },
 }
 
@@ -306,18 +334,35 @@ pub fn render_layout(
                 dx,
                 dy,
                 span,
+                frames: crossing,
                 speed,
                 reverse,
-                ..
+                cadence,
             } = prep.kind
             else {
                 continue;
             };
-            // Progress is clamped at full travel: a scroller done before the
-            // package ends holds its final, fully-exited position, which draws
-            // nothing — parked outside its destination edge. Reverse mirrors
-            // the progress, entering at the normal path's exit.
-            let forward = (i as i64 * speed).min(span);
+            // Progress is clamped at full travel: a scroller past its crossing
+            // holds the final, fully-exited position, which draws nothing — parked
+            // outside its destination edge. `Once` runs a single crossing on the
+            // package clock; `Repeat` tiles the package with `cycles` whole cycles
+            // (each a crossing plus a gap shorter than crossing/cycles) and runs
+            // its crossing on the cycle-local clock, with the phase advancing the
+            // region's whole timeline modulo the package so the tiling — and the
+            // loop seam — stay intact. Reverse mirrors the progress, entering at
+            // the normal path's exit.
+            let local = match cadence {
+                Cadence::Once => i as i64,
+                Cadence::Repeat { phase_per_mille } => {
+                    let package = package_frames as i64;
+                    let cycles = (package / crossing as i64).max(1);
+                    let shift = round_div(i64::from(phase_per_mille) * (package / cycles), 1000);
+                    let shifted = (i as i64 + shift) % package;
+                    let cycle = (shifted * cycles) / package;
+                    shifted - (cycle * package) / cycles
+                }
+            };
+            let forward = (local * speed).min(span);
             let prog = if reverse { span - forward } else { forward };
             let left = start_x + round_div(prog * dx, span);
             let top = start_y + round_div(prog * dy, span);
@@ -416,7 +461,16 @@ fn prepare_region(
             path,
             direction,
             speed_px_s,
+            cadence,
         } => {
+            if let Cadence::Repeat { phase_per_mille } = cadence
+                && phase_per_mille > 999
+            {
+                return Err(LayoutError::BadPhase {
+                    region: index,
+                    phase: phase_per_mille,
+                });
+            }
             // Motion reveals clipping only along the axis of travel; on the
             // perpendicular axis a scroller is as blind as fixed text, so overflow
             // there would be cropped in every frame and is refused instead. A
@@ -477,6 +531,7 @@ fn prepare_region(
                 frames,
                 speed,
                 reverse: matches!(direction, ScrollDirection::Reverse),
+                cadence,
             }
         }
     };
@@ -551,6 +606,7 @@ mod tests {
                 direction,
                 // 25 px/s at 25 fps is exactly one pixel per frame.
                 speed_px_s: 25,
+                cadence: Cadence::Once,
             },
         }
     }
@@ -764,6 +820,7 @@ mod tests {
                 // Half the short region's speed: this scroller runs roughly twice
                 // as long and defines the package length.
                 speed_px_s: 12,
+                cadence: Cadence::Once,
             },
             ..scroller(
                 rect(0, 32, 64, 8),
@@ -799,6 +856,7 @@ mod tests {
                 path: ScrollPath::LeftToRight,
                 direction: ScrollDirection::Normal,
                 speed_px_s: 5,
+                cadence: Cadence::Once,
             },
             ..scroller(
                 rect(0, 0, 64, 8),
@@ -896,6 +954,7 @@ mod tests {
                     path: ScrollPath::LeftToRight,
                     direction: ScrollDirection::Normal,
                     speed_px_s: speed,
+                    cadence: Cadence::Once,
                 },
                 ..fixed(rect(0, 0, 64, 16), "HI")
             };
@@ -1090,5 +1149,125 @@ mod tests {
             Rgb::new(0, 0, 255),
             "a background corner the glyphs do not cover shows the region background"
         );
+    }
+
+    /// Region B's geometry: "O" crossing a 12px-tall strip at one pixel per frame
+    /// needs 21 frames; against the 153-frame package below that tiles into 7 cycles.
+    fn repeat_scroller(phase_per_mille: u16) -> RegionSpec {
+        RegionSpec {
+            behavior: RegionBehavior::Scroll {
+                path: ScrollPath::TopToBottom,
+                direction: ScrollDirection::Normal,
+                speed_px_s: 25,
+                cadence: Cadence::Repeat { phase_per_mille },
+            },
+            ..scroller(
+                rect(0, 0, 32, 12),
+                "O",
+                ScrollPath::TopToBottom,
+                ScrollDirection::Normal,
+            )
+        }
+    }
+
+    /// The 153-frame pacemaker from the single-crossing test, kept out of the
+    /// repeat region's rows so per-rect pixel checks cannot see it.
+    fn pacemaker() -> RegionSpec {
+        scroller(
+            rect(0, 52, 64, 12),
+            "HELLO WORLD",
+            ScrollPath::LeftToRight,
+            ScrollDirection::Normal,
+        )
+    }
+
+    /// Lit pixels of `frame` inside `r`.
+    fn lit_in(frame: &Frame, r: Rect) -> Vec<(usize, usize)> {
+        lit(frame)
+            .into_iter()
+            .filter(|&(x, y)| {
+                x >= r.x as usize
+                    && x < (r.x + r.width) as usize
+                    && y >= r.y as usize
+                    && y < (r.y + r.height) as usize
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_repeating_scroller_recrosses_instead_of_parking() {
+        let strip = rect(0, 0, 32, 12);
+        let once = [
+            RegionSpec {
+                behavior: RegionBehavior::Scroll {
+                    path: ScrollPath::TopToBottom,
+                    direction: ScrollDirection::Normal,
+                    speed_px_s: 25,
+                    cadence: Cadence::Once,
+                },
+                ..repeat_scroller(0)
+            },
+            pacemaker(),
+        ];
+        let repeat = [repeat_scroller(0), pacemaker()];
+
+        let once_seq = render_layout(&once, canvas(), rate(), 1_500).expect("renders");
+        let repeat_seq = render_layout(&repeat, canvas(), rate(), 1_500).expect("renders");
+
+        // Cadence does not change the package length: the longest single crossing
+        // still sets it.
+        assert_eq!(once_seq.len(), 153);
+        assert_eq!(repeat_seq.len(), 153);
+
+        // Late in the package the Once scroller has long parked, while the repeat
+        // scroller is mid-recross.
+        assert!(lit_in(once_seq.get(140).expect("frame"), strip).is_empty());
+        assert!(!lit_in(repeat_seq.get(140).expect("frame"), strip).is_empty());
+    }
+
+    #[test]
+    fn repeat_cycles_tile_the_package_evenly() {
+        let strip = rect(0, 0, 32, 12);
+        let regions = [repeat_scroller(0), pacemaker()];
+        let sequence = render_layout(&regions, canvas(), rate(), 1_500).expect("renders");
+
+        // Count entry events: frames where the strip goes from empty to lit. A
+        // 21-frame crossing tiles a 153-frame package into floor(153/21) = 7 cycles.
+        let mut entries = 0;
+        let mut was_lit = false;
+        for i in 0..sequence.len() {
+            let is_lit = !lit_in(sequence.get(i).expect("frame"), strip).is_empty();
+            if is_lit && !was_lit {
+                entries += 1;
+            }
+            was_lit = is_lit;
+        }
+        assert_eq!(entries, 7, "every cycle completes inside the package");
+
+        // The final frame is empty in the strip, so the loop seam continues a gap
+        // rather than jumping mid-glyph.
+        assert!(lit_in(sequence.get(152).expect("last"), strip).is_empty());
+    }
+
+    #[test]
+    fn phase_advances_a_repeating_scrollers_timeline() {
+        let strip = rect(0, 0, 32, 12);
+        let unphased = [repeat_scroller(0), pacemaker()];
+        let phased = [repeat_scroller(500), pacemaker()];
+
+        let unphased_seq = render_layout(&unphased, canvas(), rate(), 1_500).expect("renders");
+        let phased_seq = render_layout(&phased, canvas(), rate(), 1_500).expect("renders");
+
+        // Half a cycle of advance puts the phased region mid-crossing at frame zero,
+        // where the unphased one is still fully outside its entry edge.
+        assert!(lit_in(unphased_seq.get(0).expect("frame"), strip).is_empty());
+        assert!(!lit_in(phased_seq.get(0).expect("frame"), strip).is_empty());
+    }
+
+    #[test]
+    fn a_phase_beyond_the_cycle_is_refused() {
+        let regions = [repeat_scroller(1_000), pacemaker()];
+        let err = render_layout(&regions, canvas(), rate(), 1_500).expect_err("bad phase");
+        assert_eq!(err.code(), "matrix_layout_bad_phase");
     }
 }

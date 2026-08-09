@@ -82,7 +82,9 @@ An alert screen readable from across the room: incident header and count, affect
 - centered and scrolling text; input is capped at 100 characters, and long marquees
   must also fit the configured frame budget
 - multi-region text layouts: up to 16 non-overlapping rectangles of fixed or
-  scrolling text composed into one animated package
+  scrolling text composed into one animated package; a scroller can cross once or
+  `repeat` with a `phase` offset, so regions animate continuously and appear to
+  loop independently
 - PNG, GIF, and video normalization through isolated FFmpeg subprocesses
 - fixed-rate playout with feedback from WLED's reported frame rate
 - software power clamping before frames reach the panel

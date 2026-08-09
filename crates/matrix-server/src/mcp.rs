@@ -235,11 +235,15 @@ impl MatrixHandler {
         description = "Compose fixed and scrolling text regions into one animated \
                        package. Each region has a rectangle, text, style, and either \
                        fixed alignment or a scroll path (four canonical paths, each \
-                       reversible) with a speed in pixels per second. Every scroller \
-                       starts together, crosses its rectangle, and exits; the longest \
-                       one sets the package length and looping repeats the whole \
-                       package. Rectangles must not overlap. Returns the asset handle \
-                       and, when played, the playback handle.",
+                       reversible) with a speed in pixels per second. The longest \
+                       single crossing sets the package length and looping repeats \
+                       the whole package. By default a scroller crosses once and \
+                       parks; `repeat: true` re-enters for as many evenly spaced \
+                       crossings as fit the package, and `phase` (0 to below 1, \
+                       requires repeat) offsets where in its cycle a region starts, \
+                       so regions animate continuously and independently. Rectangles \
+                       must not overlap. Returns the asset handle and, when played, \
+                       the playback handle.",
         annotations(
             read_only_hint = false,
             destructive_hint = true,
