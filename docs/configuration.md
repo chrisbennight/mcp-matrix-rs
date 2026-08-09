@@ -15,6 +15,7 @@ variable listed below. Run `matrix-server --help` for the corresponding option n
 | `MATRIX_DEVICE_TIMEOUT_MS` | no | `3000` | Timeout for WLED JSON API calls |
 | `MATRIX_FFMPEG_BIN` | no | `ffmpeg` | FFmpeg executable path |
 | `MATRIX_FFPROBE_BIN` | no | `ffprobe` | ffprobe executable path |
+| `MATRIX_STDIO` | no | off | Serve MCP over stdio to the spawning client instead of listening on HTTP |
 
 The width and height must describe the WLED matrix layout. The server reports the
 dimensions returned by WLED but does not currently reconcile a mismatch automatically.
@@ -26,6 +27,11 @@ not an mDNS or DNS hostname. The HTTP URL may use a hostname.
 `MATRIX_ALLOWED_HOSTS` is a DNS-rebinding defense, not authentication. Include every
 authority through which an MCP client reaches the service, without a URL scheme. The
 `/healthz` liveness endpoint is intentionally outside this check.
+
+With `MATRIX_STDIO` (or `--stdio`) set, the server speaks MCP over its own stdin and
+stdout for the one client that spawned it, and `MATRIX_HTTP_ADDR`,
+`MATRIX_ALLOWED_HOSTS`, and `--healthcheck` do not apply. All logging goes to stderr
+in both modes, so stdout stays valid JSON-RPC.
 
 The container pins FFmpeg and ffprobe to `/usr/bin`. Override their paths only when
 running the standalone binary with a deliberately selected installation.

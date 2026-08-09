@@ -1,7 +1,8 @@
 //! MCP server for the matrix render engine.
 //!
-//! Protocol `2026-07-28`, served over Streamable HTTP. The application has no
-//! client-authentication path and all callers share engine state.
+//! Protocol `2026-07-28`, served over Streamable HTTP or, for a spawning client, over
+//! stdio. The application has no client-authentication path and all callers share
+//! engine state.
 
 pub mod mcp;
 pub mod state;

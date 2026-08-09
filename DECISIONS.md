@@ -84,3 +84,22 @@ public-domain 8x8 bitmap font data, no dependencies). Glyphs are const arrays: n
 parsing, no allocation, no rasterizer attack surface, and a vector font would be
 wasted on a 64-pixel panel. Characters outside coverage render as `?` rather than
 refusing the message. Text obeys the same frame budget the media path decodes under.
+
+## stdio as a flag on the one binary rather than a second binary
+
+Some MCP clients cannot reach a remote server at all; they only spawn a local process
+and speak JSON-RPC over its stdin and stdout. `matrix-server --stdio` serves them with
+the same `MatrixHandler` the Streamable HTTP transport uses, so the advertised tool
+catalog cannot drift between transports and `smoke/expected-tools.txt` stays the single
+release catalog.
+
+A separate stdio binary would double the release surface for no behavioural gain, and
+serving both transports from one process would blur process ownership: stdio's contract
+is that the spawning client owns the lifetime, ending the session by closing stdin.
+Process exit stops the device poller, and WLED's realtime timeout returns the panel to
+ambient — the same failure posture as the HTTP server dying.
+
+The trade is concurrency. The HTTP server multiplexes callers over one engine; each
+stdio process is a full engine that believes it exclusively owns the panel. That fits
+the intended audience — one desktop client per panel — and the deployment guide says
+so rather than the server attempting cross-process coordination.

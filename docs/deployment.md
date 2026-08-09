@@ -13,6 +13,11 @@ authorize a caller.
 
 Use one of these deployment shapes:
 
+- Run the standalone binary with `--stdio` as a child process the MCP client spawns.
+  The OS process boundary is the trust boundary, and there is exactly one client per
+  process. Each stdio process assumes it is the panel's only driver: run one per panel
+  and do not combine it with a concurrently serving HTTP instance, or clients will
+  contend for the frame stream without seeing each other's state.
 - Bind the standalone binary to its default loopback address for a client on the same
   host.
 - Publish the example container port on loopback and connect through an authenticated
@@ -56,6 +61,9 @@ present in operational logs and errors.
 serving. They do not prove the panel is reachable. Use `matrix_describe_device` as the
 device readiness check and verify the reported dimensions, frame rate, and power ceiling
 before first playback.
+
+A stdio instance has no liveness endpoint; the spawning client observes process health
+directly, and `matrix_describe_device` remains the device readiness check.
 
 The server keeps assets only in memory. Restarting it clears assets and playback
 handles; WLED's realtime timeout then restores ambient behavior.

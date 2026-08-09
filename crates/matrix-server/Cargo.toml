@@ -1,6 +1,6 @@
 [package]
 name = "matrix-server"
-description = "MCP 2026-07-28 server: streamable HTTP transport, tool dispatch, and the engine it drives"
+description = "MCP 2026-07-28 server: streamable HTTP and stdio transports, tool dispatch, and the engine it drives"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -22,6 +22,7 @@ rmcp = { version = "3", default-features = false, features = [
     "server",
     "macros",
     "transport-streamable-http-server",
+    "transport-io",
 ] }
 axum = "0.8"
 # Used only by the --healthcheck self-probe (a plain loopback GET).
