@@ -174,6 +174,9 @@ struct Ticket {
     credential_hash: [u8; 32],
     partial: PathBuf,
     final_path: PathBuf,
+    /// The reference a tool call redeems. Independent of the upload identifier, which
+    /// travels in a URL and therefore in proxy logs.
+    staged_id: String,
     /// The exact size to verify against, present only when the caller stated one.
     declared_size: Option<u64>,
     /// What may be streamed at most, always present. Equals `declared_size` when there
@@ -189,7 +192,9 @@ struct Ticket {
 /// Both occupy a slot. An in-flight transfer that vanished from this map would be
 /// counted by nothing while still holding a partial file and a connection.
 enum TicketState {
-    Idle(Ticket),
+    /// Boxed: an in-flight slot carries no data, and an unboxed ticket would make every
+    /// entry in the map the size of the largest one.
+    Idle(Box<Ticket>),
     InFlight,
 }
 
@@ -211,6 +216,13 @@ pub struct Staged {
     pub media_type: String,
     pub bytes: u64,
     staged_at: Instant,
+    /// Held from the moment a tool call takes this out of the plane until its file is
+    /// gone. Between those points the entry is in no map, and without this the bytes
+    /// would be counted by nothing while a submission queued for a decode slot — which
+    /// is exactly the accounting hole the ticket's in-flight state closes on the other
+    /// side. A counter rather than a handle to the plane, so there is no reference cycle
+    /// and `Drop` needs no async.
+    consuming: Option<Arc<std::sync::atomic::AtomicUsize>>,
 }
 
 impl Staged {
@@ -222,6 +234,9 @@ impl Staged {
 impl Drop for Staged {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.path);
+        if let Some(consuming) = &self.consuming {
+            consuming.fetch_sub(1, std::sync::atomic::Ordering::Release);
+        }
     }
 }
 
@@ -242,6 +257,9 @@ pub struct FilePlane {
     config: FileConfig,
     tickets: Mutex<HashMap<String, TicketState>>,
     staged: Mutex<HashMap<String, Staged>>,
+    /// Sources taken by a tool call whose files still exist. Counted alongside the maps,
+    /// so the ceiling bounds bytes on disk rather than bytes in a map.
+    consuming: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 /// Reject anything that is not a bare `https` origin.
@@ -305,11 +323,13 @@ impl FilePlane {
             .await
             .map_err(|e| FileError::Staging(format!("creating the staging directory: {e}")))?;
         restrict_directory(&config.staging_dir)?;
+        discard_orphans(&config.staging_dir).await?;
 
         Ok(Arc::new(Self {
             config,
             tickets: Mutex::new(HashMap::new()),
             staged: Mutex::new(HashMap::new()),
+            consuming: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }))
     }
 
@@ -346,20 +366,28 @@ impl FilePlane {
             }
         };
 
-        let id = random_token();
+        // Three independent secrets, not one reused three times. The upload identifier
+        // appears in the descriptor URL and therefore in ordinary proxy access logs; the
+        // reference a tool call later redeems must not be derivable from it, because
+        // `take` authorizes consumption by that reference alone. Keeping the credential
+        // out of the URL while putting the consumption capability in it would have
+        // defeated the point.
+        let upload_id = random_token();
+        let staged_id = random_token();
         let credential = random_token();
         let media_type = params
             .mime_type
             .clone()
             .unwrap_or_else(|| "application/octet-stream".into());
 
-        // Both paths are built from the minted identifier, never from anything a caller
+        // Both paths are built from minted identifiers, never from anything a caller
         // supplied. The ingest route looks an identifier up in this map and uses the
         // stored path; it never joins a request component onto the staging directory.
         let ticket = Ticket {
             credential_hash: sha256(credential.as_bytes()),
-            partial: self.config.staging_dir.join(format!("{id}.part")),
-            final_path: self.config.staging_dir.join(&id),
+            partial: self.config.staging_dir.join(format!("{upload_id}.part")),
+            final_path: self.config.staging_dir.join(&staged_id),
+            staged_id: staged_id.clone(),
             declared_size: params.size,
             ceiling,
             declared_digest,
@@ -374,23 +402,25 @@ impl FilePlane {
         {
             let mut tickets = self.tickets.lock().await;
             let staged = self.staged.lock().await;
-            let outstanding = tickets.len() + staged.len();
+            let outstanding = tickets.len()
+                + staged.len()
+                + self.consuming.load(std::sync::atomic::Ordering::Acquire);
             if outstanding >= self.config.max_staged {
                 return Err(FileError::TooManyStaged {
                     staged: outstanding,
                 });
             }
-            tickets.insert(id.clone(), TicketState::Idle(ticket));
+            tickets.insert(upload_id.clone(), TicketState::Idle(Box::new(ticket)));
         }
 
-        let url = format!("{}/files/upload/{id}", self.config.public_origin);
+        let url = format!("{}/files/upload/{upload_id}", self.config.public_origin);
 
         let mut headers = HashMap::new();
         headers.insert("Authorization".to_string(), format!("Bearer {credential}"));
 
         Ok(AuthorizeUploadResult {
             file: FileValue {
-                uri: format!("{STAGED_PREFIX}{id}"),
+                uri: format!("{STAGED_PREFIX}{staged_id}"),
                 name: params.name,
                 // Echoed exactly as declared, never substituted: an intermediary refuses a
                 // result that alters the metadata it just sent.
@@ -444,7 +474,7 @@ impl FilePlane {
         }
 
         match tickets.insert(id.to_string(), TicketState::InFlight) {
-            Some(TicketState::Idle(ticket)) => Ok(ticket),
+            Some(TicketState::Idle(ticket)) => Ok(*ticket),
             _ => unreachable!("the idle ticket was matched under this lock"),
         }
     }
@@ -474,7 +504,7 @@ impl FilePlane {
         // Bounded in time as well as in bytes. A transfer that stalls forever would
         // otherwise hold its slot forever, and enough of those wedge the plane for
         // everyone; the same window that expires an unused authorization applies here.
-        let outcome = tokio::time::timeout(self.config.ttl, self.stream_into(id, &ticket, chunks))
+        let outcome = tokio::time::timeout(self.config.ttl, self.stream_into(&ticket, chunks))
             .await
             .unwrap_or(Err(FileError::Expired));
 
@@ -484,12 +514,7 @@ impl FilePlane {
         outcome
     }
 
-    async fn stream_into<S, E>(
-        &self,
-        id: &str,
-        ticket: &Ticket,
-        mut chunks: S,
-    ) -> Result<(), FileError>
+    async fn stream_into<S, E>(&self, ticket: &Ticket, mut chunks: S) -> Result<(), FileError>
     where
         S: futures_util::Stream<Item = Result<bytes::Bytes, E>> + Unpin,
         E: std::fmt::Display,
@@ -551,12 +576,13 @@ impl FilePlane {
             .map_err(|e| FileError::Staging(format!("publishing the staged file: {e}")))?;
 
         self.staged.lock().await.insert(
-            id.to_string(),
+            ticket.staged_id.clone(),
             Staged {
                 path: ticket.final_path.clone(),
                 media_type: ticket.media_type.clone(),
                 bytes: written,
                 staged_at: Instant::now(),
+                consuming: None,
             },
         );
         Ok(())
@@ -570,7 +596,13 @@ impl FilePlane {
     /// rather than a lookup somewhere else.
     pub async fn take(&self, uri: &str) -> Option<Staged> {
         let id = uri.strip_prefix(STAGED_PREFIX)?;
-        self.staged.lock().await.remove(id)
+        let mut staged = self.staged.lock().await.remove(id)?;
+        // Keeps occupying the ceiling until its file is gone. A submission can queue for
+        // a decode slot for a long time, and the bytes are on disk for all of it.
+        self.consuming
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
+        staged.consuming = Some(self.consuming.clone());
+        Some(staged)
     }
 
     /// Drop authorizations and staged bytes that outlived their window.
@@ -593,10 +625,11 @@ impl FilePlane {
     }
 
     #[cfg(test)]
-    pub async fn outstanding(&self) -> (usize, usize) {
+    pub async fn buckets(&self) -> (usize, usize, usize) {
         (
             self.tickets.lock().await.len(),
             self.staged.lock().await.len(),
+            self.consuming.load(std::sync::atomic::Ordering::Acquire),
         )
     }
 }
@@ -607,6 +640,37 @@ fn decode_digest(value: &str) -> Result<[u8; 32], FileError> {
         .decode(value)
         .map_err(|_| FileError::DigestMismatch)?;
     raw.try_into().map_err(|_| FileError::DigestMismatch)
+}
+
+/// Clear anything a previous process left in the staging directory.
+///
+/// Every file here belongs to a ticket or a staged source, and both live only in memory.
+/// A process that exits without unwinding — SIGTERM, a crash, a container stop — runs no
+/// `Drop`, so its partials and unconsumed transfers survive with nothing left that knows
+/// about them: invisible to the sweeper, uncounted against the ceiling, and never
+/// removed. The next start is the only moment that can reclaim them.
+///
+/// This makes the directory exclusive to one server instance. Two processes sharing one
+/// would delete each other's work in progress, and nothing here coordinates them.
+async fn discard_orphans(dir: &Path) -> Result<(), FileError> {
+    let mut entries = tokio::fs::read_dir(dir)
+        .await
+        .map_err(|e| FileError::Staging(format!("reading the staging directory: {e}")))?;
+
+    let mut discarded = 0usize;
+    while let Some(entry) = entries
+        .next_entry()
+        .await
+        .map_err(|e| FileError::Staging(format!("listing the staging directory: {e}")))?
+    {
+        if entry.path().is_file() && tokio::fs::remove_file(entry.path()).await.is_ok() {
+            discarded += 1;
+        }
+    }
+    if discarded > 0 {
+        tracing::info!(discarded, "discarded staged files left by a previous run");
+    }
+    Ok(())
 }
 
 /// Owner-only on the staging directory. A newly created one gets `0700`.
@@ -756,8 +820,16 @@ mod tests {
             .to_string()
     }
 
+    /// The identifier the ingest route keys on, which lives in the descriptor URL and is
+    /// deliberately not the reference a tool call later redeems.
     fn id_of(result: &AuthorizeUploadResult) -> String {
-        result.file.uri.strip_prefix(STAGED_PREFIX).unwrap().into()
+        result
+            .upload
+            .url
+            .rsplit('/')
+            .next()
+            .expect("upload id")
+            .into()
     }
 
     fn params(size: u64, digest: Option<[u8; 32]>) -> AuthorizeUploadParams {
@@ -928,7 +1000,7 @@ mod tests {
             .await
             .expect_err("over the source ceiling");
         assert_eq!(err.code(), "matrix_file_declared_too_large");
-        assert_eq!(plane.outstanding().await, (0, 0), "nothing was minted");
+        assert_eq!(plane.buckets().await, (0, 0, 0), "nothing was minted");
     }
 
     #[tokio::test]
@@ -976,7 +1048,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(20)).await;
         plane.sweep().await;
 
-        assert_eq!(plane.outstanding().await, (0, 0));
+        assert_eq!(plane.buckets().await, (0, 0, 0));
         let err = plane
             .receive(
                 &id_of(&authorized),
@@ -1095,6 +1167,115 @@ mod tests {
             FileError::DigestMismatch.public_code(),
             "matrix_file_digest_mismatch"
         );
+    }
+
+    #[tokio::test]
+    async fn the_upload_url_does_not_reveal_the_reference_a_tool_call_redeems() {
+        // The upload identifier is in the descriptor URL and therefore in ordinary proxy
+        // access logs. `take` authorizes consumption by the staged reference alone, so
+        // deriving one from the other would have handed anyone reading those logs the
+        // ability to burn another caller's staged source — while the credential was
+        // being carefully kept out of the URL for exactly that reason.
+        let plane = plane("distinct-ids", 1024).await;
+        let authorized = plane.authorize_upload(params(4, None)).await.expect("ok");
+
+        let upload_id = authorized
+            .upload
+            .url
+            .rsplit('/')
+            .next()
+            .expect("upload identifier");
+        let staged_ref = authorized
+            .file
+            .uri
+            .strip_prefix(STAGED_PREFIX)
+            .expect("staged reference");
+
+        assert_ne!(upload_id, staged_ref);
+        assert!(!authorized.upload.url.contains(staged_ref));
+        assert!(!authorized.file.uri.contains(upload_id));
+
+        // And the URL identifier is not itself redeemable as a reference.
+        plane
+            .receive(upload_id, &credential_of(&authorized), body(vec![b"four"]))
+            .await
+            .expect("the transfer still completes");
+        assert!(
+            plane
+                .take(&format!("{STAGED_PREFIX}{upload_id}"))
+                .await
+                .is_none(),
+            "the upload identifier must not redeem the staged source"
+        );
+        assert!(plane.take(&authorized.file.uri).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn a_source_a_tool_call_is_holding_still_occupies_the_ceiling() {
+        // Between `take` and the decode finishing, the bytes are on disk but in no map.
+        // A submission can queue for a decode slot for a long time, so counting only the
+        // maps would bound the bookkeeping rather than the storage the ceiling sizes.
+        let plane = FilePlane::new(FileConfig {
+            public_origin: "https://panel.example".into(),
+            staging_dir: scratch("consuming"),
+            ttl: Duration::from_secs(30),
+            max_staged: 1,
+            max_source_bytes: 1024,
+        })
+        .await
+        .expect("plane");
+
+        let authorized = plane.authorize_upload(params(4, None)).await.expect("ok");
+        plane
+            .receive(
+                &id_of(&authorized),
+                &credential_of(&authorized),
+                body(vec![b"four"]),
+            )
+            .await
+            .expect("transfer completes");
+
+        let held = plane.take(&authorized.file.uri).await.expect("staged");
+        assert_eq!(plane.buckets().await, (0, 0, 1), "held, and still counted");
+
+        let err = plane
+            .authorize_upload(params(4, None))
+            .await
+            .expect_err("the held source still occupies the only slot");
+        assert_eq!(err.code(), "matrix_file_too_many_staged");
+
+        // Releasing it frees the slot and removes the file.
+        let path = held.path().to_path_buf();
+        drop(held);
+        assert_eq!(plane.buckets().await, (0, 0, 0));
+        assert!(!path.exists(), "the staged file is gone with its holder");
+        plane
+            .authorize_upload(params(4, None))
+            .await
+            .expect("the slot is free again");
+    }
+
+    #[tokio::test]
+    async fn files_left_by_a_previous_run_are_discarded_at_startup() {
+        // A process killed without unwinding runs no Drop, so its partials survive with
+        // nothing in memory that knows about them: invisible to the sweeper and
+        // uncounted. Startup is the only moment that can reclaim them.
+        let dir = scratch("orphans");
+        std::fs::create_dir_all(&dir).expect("dir");
+        let orphan = dir.join("left-behind.part");
+        std::fs::write(&orphan, b"from a previous process").expect("orphan");
+
+        let _plane = FilePlane::new(FileConfig {
+            public_origin: "https://panel.example".into(),
+            staging_dir: dir.clone(),
+            ttl: Duration::from_secs(30),
+            max_staged: 4,
+            max_source_bytes: 1024,
+        })
+        .await
+        .expect("plane");
+
+        assert!(!orphan.exists(), "a previous run's file must not survive");
     }
 
     #[test]

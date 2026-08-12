@@ -912,9 +912,18 @@ async fn media_past_the_inline_cap_reaches_the_panel_by_reference() {
 
     // The intermediary streams the bytes to the descriptor. It would dial the configured
     // origin; the test dials the listener that origin fronts.
-    let id = uri
-        .strip_prefix(matrix_server::files::STAGED_PREFIX)
-        .expect("staged prefix");
+    // The path the descriptor names, which is deliberately not the reference the tool
+    // call redeems — that one must not be derivable from a URL a proxy logs.
+    let id = result["upload"]["url"]
+        .as_str()
+        .expect("url")
+        .rsplit('/')
+        .next()
+        .expect("upload identifier");
+    assert!(
+        !uri.contains(id),
+        "the staged reference must not be derivable from the upload URL"
+    );
     let upload = server
         .client
         .put(format!("{}/files/upload/{id}", server.base))
