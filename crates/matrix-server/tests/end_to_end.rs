@@ -898,7 +898,7 @@ async fn media_past_the_inline_cap_reaches_the_panel_by_reference() {
         .as_str()
         .expect("staged uri")
         .to_string();
-    let credential = result["upload"]["headers"]["Authorization"]
+    let credential = result["upload"]["headers"][matrix_server::files::TRANSFER_CREDENTIAL_HEADER]
         .as_str()
         .expect("credential")
         .to_string();
@@ -906,8 +906,12 @@ async fn media_past_the_inline_cap_reaches_the_panel_by_reference() {
         !result["upload"]["url"]
             .as_str()
             .expect("url")
-            .contains(credential.trim_start_matches("Bearer ")),
+            .contains(&credential),
         "the credential must never appear in the descriptor URL"
+    );
+    assert!(
+        result["upload"]["headers"]["Authorization"].is_null(),
+        "Authorization stays free for whatever boundary fronts this route"
     );
 
     // The intermediary streams the bytes to the descriptor. It would dial the configured
@@ -927,7 +931,10 @@ async fn media_past_the_inline_cap_reaches_the_panel_by_reference() {
     let upload = server
         .client
         .put(format!("{}/files/upload/{id}", server.base))
-        .header("Authorization", &credential)
+        .header(
+            matrix_server::files::TRANSFER_CREDENTIAL_HEADER,
+            &credential,
+        )
         .body(payload.clone())
         .send()
         .await

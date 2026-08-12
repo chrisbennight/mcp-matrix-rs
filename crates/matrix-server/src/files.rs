@@ -32,6 +32,16 @@ use tokio::time::Instant;
 /// dereferenceable location and nothing ever treats it as one.
 pub const STAGED_PREFIX: &str = "matrix-file://staged/";
 
+/// Header the transfer credential travels in.
+///
+/// Deliberately not `Authorization`. The ingest route is meant to sit behind the same
+/// authenticated boundary as `/mcp`, and a boundary that authenticates callers from
+/// `Authorization` would have nowhere to put its own credential once this one claimed
+/// that header — it would reject the transfer before this server ever saw it. A
+/// dedicated name lets both travel on the same request, and it is still a header rather
+/// than part of the URL, which is the property that keeps it out of proxy access logs.
+pub const TRANSFER_CREDENTIAL_HEADER: &str = "Matrix-Transfer-Credential";
+
 /// Bytes of entropy in a ticket identifier and in a transfer credential.
 ///
 /// The engine's ordinary handles are a process token plus a counter and are documented as
@@ -424,7 +434,7 @@ impl FilePlane {
         let url = format!("{}/files/upload/{upload_id}", self.config.public_origin);
 
         let mut headers = HashMap::new();
-        headers.insert("Authorization".to_string(), format!("Bearer {credential}"));
+        headers.insert(TRANSFER_CREDENTIAL_HEADER.to_string(), credential);
 
         Ok(AuthorizeUploadResult {
             file: FileValue {
@@ -763,7 +773,7 @@ async fn ingest(
     use axum::http::StatusCode;
     use axum::response::IntoResponse as _;
 
-    let Some(credential) = bearer(&headers) else {
+    let Some(credential) = presented_credential(&headers) else {
         return refusal(
             StatusCode::FORBIDDEN,
             FileError::BadCredential.public_code(),
@@ -794,12 +804,8 @@ fn refusal(status: axum::http::StatusCode, code: &str) -> axum::response::Respon
     (status, axum::Json(serde_json::json!({ "error": code }))).into_response()
 }
 
-fn bearer(headers: &axum::http::HeaderMap) -> Option<&str> {
-    headers
-        .get(axum::http::header::AUTHORIZATION)?
-        .to_str()
-        .ok()?
-        .strip_prefix("Bearer ")
+fn presented_credential(headers: &axum::http::HeaderMap) -> Option<&str> {
+    headers.get(TRANSFER_CREDENTIAL_HEADER)?.to_str().ok()
 }
 
 /// How often expired authorizations and staged sources are collected.
@@ -854,10 +860,7 @@ mod tests {
     }
 
     fn credential_of(result: &AuthorizeUploadResult) -> String {
-        result.upload.headers["Authorization"]
-            .strip_prefix("Bearer ")
-            .expect("bearer credential")
-            .to_string()
+        result.upload.headers[TRANSFER_CREDENTIAL_HEADER].clone()
     }
 
     /// The identifier the ingest route keys on, which lives in the descriptor URL and is
@@ -927,8 +930,15 @@ mod tests {
             authorized.upload.url
         );
         assert!(
-            authorized.upload.headers.contains_key("Authorization"),
+            authorized
+                .upload
+                .headers
+                .contains_key(TRANSFER_CREDENTIAL_HEADER),
             "the credential travels in a header, not the URL"
+        );
+        assert!(
+            !authorized.upload.headers.contains_key("Authorization"),
+            "Authorization is left free for whatever boundary fronts this route"
         );
         assert!(
             !authorized.upload.url.contains(&credential_of(&authorized)),

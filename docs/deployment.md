@@ -69,11 +69,16 @@ source ceiling.
 
 Do not point it at a shared directory such as the container's `/tmp`. Two instances
 sharing one would discard each other's transfers in progress, and nothing coordinates
-them. The server does not rely on that advice being followed — it only removes files
-whose names it could have minted, and it sets permissions only on a directory it created
-itself, so a misconfigured path costs a wasted transfer rather than somebody else's data
-— but a dedicated mount is the supported arrangement and the only one whose capacity you
-can reason about.
+them.
+
+The server reduces the damage of getting this wrong without being able to eliminate it.
+It sets permissions only on a directory it created itself, so it will not re-permission
+one you provisioned. At startup it removes only files whose names have the shape it
+mints — 43 base64url characters, optionally with a `.part` suffix — so ordinary files
+sharing the directory survive. That is a heuristic on the name and not proof of
+provenance: another process writing files of the same shape into the same directory
+would still lose them. A dedicated mount is the supported arrangement and the only one
+whose capacity and contents you can reason about.
 
 Startup discards what a previous run left behind. A process killed without unwinding runs
 no cleanup, so its partial and unconsumed files would otherwise survive with nothing left
