@@ -195,6 +195,9 @@ struct Ticket {
     declared_digest: Option<[u8; 32]>,
     media_type: String,
     expires_at: Instant,
+    /// Set once the staged source is recorded, which is the moment something else starts
+    /// owning the final file.
+    published: std::sync::atomic::AtomicBool,
 }
 
 /// Holds an in-flight slot for exactly as long as its transfer runs.
@@ -228,10 +231,18 @@ enum TicketState {
 }
 
 impl Drop for Ticket {
-    /// An authorization that never completed leaves nothing behind. After a successful
-    /// rename the partial no longer exists and the removal is a no-op.
+    /// An authorization that never completed leaves nothing behind.
+    ///
+    /// Both paths, because cancellation can land between the rename and the moment the
+    /// staged source is recorded: the partial is gone by then and the final file exists
+    /// with nothing in any map pointing at it — invisible to the sweeper and uncounted.
+    /// Once publication has happened the staged source owns that file, so this must not
+    /// touch it.
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.partial);
+        if !self.published.load(std::sync::atomic::Ordering::Acquire) {
+            let _ = std::fs::remove_file(&self.final_path);
+        }
     }
 }
 
@@ -430,6 +441,7 @@ impl FilePlane {
             declared_digest,
             media_type: media_type.clone(),
             expires_at: Instant::now() + self.config.ttl,
+            published: std::sync::atomic::AtomicBool::new(false),
         };
 
         // Counted and inserted without releasing the lock in between. Checking the
@@ -623,6 +635,10 @@ impl FilePlane {
                 consuming: None,
             },
         );
+        // From here the staged source owns the file, so the ticket's drop must leave it.
+        ticket
+            .published
+            .store(true, std::sync::atomic::Ordering::Release);
         Ok(())
     }
 
@@ -634,6 +650,7 @@ impl FilePlane {
     /// rather than a lookup somewhere else.
     pub async fn take(&self, uri: &str) -> Option<Staged> {
         let id = uri.strip_prefix(STAGED_PREFIX)?;
+        let ttl = self.config.ttl;
 
         let mut staged = {
             // The hand-off happens under the staged lock, so anyone counting sees either
@@ -642,6 +659,16 @@ impl FilePlane {
             // past the ceiling.
             let mut entries = self.staged.lock().expect("transfer state lock");
             let staged = entries.remove(id)?;
+
+            // Checked here rather than left to the sweeper. This reference is the only
+            // thing authorizing consumption, so "expiring" has to be a fact about
+            // redeeming it; enforcing it on a 30-second cycle would leave it usable for
+            // up to that long past its window. Removing the expired entry on the way
+            // out lets its file go with it.
+            if Instant::now().saturating_duration_since(staged.staged_at) > ttl {
+                return None;
+            }
+
             self.consuming
                 .fetch_add(1, std::sync::atomic::Ordering::Release);
             staged
@@ -1281,6 +1308,44 @@ mod tests {
             "the upload identifier must not redeem the staged source"
         );
         assert!(plane.take(&authorized.file.uri).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn a_staged_reference_stops_being_redeemable_the_moment_it_expires() {
+        // The reference is the only thing authorizing consumption, so its window has to
+        // be enforced where it is redeemed. Leaving that to the sweeper kept an expired
+        // reference usable for up to a sweep interval — thirty seconds by default.
+        let plane = FilePlane::new(FileConfig {
+            public_origin: "https://panel.example".into(),
+            staging_dir: scratch("stale-take"),
+            ttl: Duration::from_millis(30),
+            max_staged: 4,
+            max_source_bytes: 1024,
+        })
+        .await
+        .expect("plane");
+
+        let authorized = plane.authorize_upload(params(4, None)).await.expect("ok");
+        plane
+            .receive(
+                &id_of(&authorized),
+                &credential_of(&authorized),
+                body(vec![b"four"]),
+            )
+            .await
+            .expect("transfer completes");
+
+        // Past its window, with no sweep in between.
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        assert!(
+            plane.take(&authorized.file.uri).await.is_none(),
+            "an expired reference must not redeem, sweep or no sweep"
+        );
+        assert_eq!(
+            plane.buckets().await,
+            (0, 0, 0),
+            "and it must not keep occupying a slot"
+        );
     }
 
     #[tokio::test]
