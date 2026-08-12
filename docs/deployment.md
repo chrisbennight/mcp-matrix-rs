@@ -62,10 +62,24 @@ the HTTPS origin clients reach that boundary at, and should be the same host `/m
 served on — an intermediary reuses its pinned MCP addresses only for a descriptor naming
 that host, and otherwise requires a publicly routable one.
 
-The staging directory needs to be writable, which the read-only root filesystem in the
-example Compose file does not provide by default. Mount a `tmpfs` sized for
-`MATRIX_FILE_MAX_STAGED` times the 64 MiB source ceiling, or point
-`MATRIX_FILE_STAGING_DIR` at the existing temporary `/tmp` mount and size that instead.
+The staging directory must be **dedicated to one server instance**, and writable — which
+the read-only root filesystem in the example Compose file does not provide by default.
+Mount a `tmpfs` at a path of its own, sized for `MATRIX_FILE_MAX_STAGED` times the 64 MiB
+source ceiling.
+
+Do not point it at a shared directory such as the container's `/tmp`. Two instances
+sharing one would discard each other's transfers in progress, and nothing coordinates
+them. The server does not rely on that advice being followed — it only removes files
+whose names it could have minted, and it sets permissions only on a directory it created
+itself, so a misconfigured path costs a wasted transfer rather than somebody else's data
+— but a dedicated mount is the supported arrangement and the only one whose capacity you
+can reason about.
+
+Startup discards what a previous run left behind. A process killed without unwinding runs
+no cleanup, so its partial and unconsumed files would otherwise survive with nothing left
+that knows about them: invisible to the sweeper, uncounted against the ceiling, and never
+removed.
+
 Newly created staging directories are restricted to the server's user, as are the files
 in them.
 

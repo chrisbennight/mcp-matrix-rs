@@ -319,10 +319,18 @@ fn sha256(bytes: &[u8]) -> [u8; 32] {
 
 impl FilePlane {
     pub async fn new(config: FileConfig) -> Result<Arc<Self>, FileError> {
+        let existed = tokio::fs::try_exists(&config.staging_dir)
+            .await
+            .unwrap_or(false);
         tokio::fs::create_dir_all(&config.staging_dir)
             .await
             .map_err(|e| FileError::Staging(format!("creating the staging directory: {e}")))?;
-        restrict_directory(&config.staging_dir)?;
+        // Only a directory this server created has its permissions set. Re-chmodding one
+        // an operator provisioned would override a deliberate choice, and if the path
+        // turned out to be shared it would change it for everything else using it.
+        if !existed {
+            restrict_directory(&config.staging_dir)?;
+        }
         discard_orphans(&config.staging_dir).await?;
 
         Ok(Arc::new(Self {
@@ -596,11 +604,21 @@ impl FilePlane {
     /// rather than a lookup somewhere else.
     pub async fn take(&self, uri: &str) -> Option<Staged> {
         let id = uri.strip_prefix(STAGED_PREFIX)?;
-        let mut staged = self.staged.lock().await.remove(id)?;
-        // Keeps occupying the ceiling until its file is gone. A submission can queue for
+
+        let mut staged = {
+            // The hand-off happens under the staged lock, so anyone counting sees either
+            // the map entry or the raised counter and never a gap between them. Releasing
+            // first would let a concurrent authorization observe neither and admit work
+            // past the ceiling.
+            let mut entries = self.staged.lock().await;
+            let staged = entries.remove(id)?;
+            self.consuming
+                .fetch_add(1, std::sync::atomic::Ordering::Release);
+            staged
+        };
+
+        // Keeps occupying the ceiling until its file is gone: a submission can queue for
         // a decode slot for a long time, and the bytes are on disk for all of it.
-        self.consuming
-            .fetch_add(1, std::sync::atomic::Ordering::Release);
         staged.consuming = Some(self.consuming.clone());
         Some(staged)
     }
@@ -663,7 +681,14 @@ async fn discard_orphans(dir: &Path) -> Result<(), FileError> {
         .await
         .map_err(|e| FileError::Staging(format!("listing the staging directory: {e}")))?
     {
-        if entry.path().is_file() && tokio::fs::remove_file(entry.path()).await.is_ok() {
+        // Only names this server could have minted. A directory should be dedicated to
+        // one instance, but "should" is not a reason to delete a file we cannot account
+        // for: a misconfiguration that shares the path must cost a wasted transfer, not
+        // somebody else's data.
+        if is_minted_name(&entry.file_name())
+            && entry.path().is_file()
+            && tokio::fs::remove_file(entry.path()).await.is_ok()
+        {
             discarded += 1;
         }
     }
@@ -671,6 +696,21 @@ async fn discard_orphans(dir: &Path) -> Result<(), FileError> {
         tracing::info!(discarded, "discarded staged files left by a previous run");
     }
     Ok(())
+}
+
+/// Whether a filename is one this server mints: a token, or a token's partial.
+///
+/// Tokens are [`TOKEN_BYTES`] of base64url without padding, so their alphabet and length
+/// are both fixed and nothing else is likely to collide with them.
+fn is_minted_name(name: &std::ffi::OsStr) -> bool {
+    let Some(name) = name.to_str() else {
+        return false;
+    };
+    let stem = name.strip_suffix(".part").unwrap_or(name);
+    stem.len() == TOKEN_BYTES.div_ceil(3) * 4 - (3 - TOKEN_BYTES % 3) % 4
+        && stem
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
 /// Owner-only on the staging directory. A newly created one gets `0700`.
@@ -1262,7 +1302,7 @@ mod tests {
         // uncounted. Startup is the only moment that can reclaim them.
         let dir = scratch("orphans");
         std::fs::create_dir_all(&dir).expect("dir");
-        let orphan = dir.join("left-behind.part");
+        let orphan = dir.join(format!("{}.part", random_token()));
         std::fs::write(&orphan, b"from a previous process").expect("orphan");
 
         let _plane = FilePlane::new(FileConfig {
@@ -1276,6 +1316,40 @@ mod tests {
         .expect("plane");
 
         assert!(!orphan.exists(), "a previous run's file must not survive");
+    }
+
+    #[tokio::test]
+    async fn startup_leaves_files_this_server_could_not_have_minted() {
+        // The directory should be dedicated, but a misconfiguration that shares it must
+        // cost a wasted transfer rather than somebody else's data — and it must not
+        // silently re-permission a directory the operator provisioned.
+        let dir = scratch("shared");
+        std::fs::create_dir_all(&dir).expect("dir");
+        let bystanders = [
+            dir.join("important.log"),
+            dir.join("a-shorter-name"),
+            dir.join("not base64!!.part"),
+        ];
+        for path in &bystanders {
+            std::fs::write(path, b"someone else's").expect("bystander");
+        }
+        let minted = dir.join(format!("{}.part", random_token()));
+        std::fs::write(&minted, b"ours").expect("minted");
+
+        let _plane = FilePlane::new(FileConfig {
+            public_origin: "https://panel.example".into(),
+            staging_dir: dir.clone(),
+            ttl: Duration::from_secs(30),
+            max_staged: 4,
+            max_source_bytes: 1024,
+        })
+        .await
+        .expect("plane");
+
+        assert!(!minted.exists(), "our own leftover is discarded");
+        for path in &bystanders {
+            assert!(path.exists(), "{} must survive", path.display());
+        }
     }
 
     #[test]

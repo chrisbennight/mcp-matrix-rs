@@ -65,8 +65,9 @@ media past the inline cap reaches the panel. Three constraints come with it:
 - **It requires the HTTP transport.** Combining it with `MATRIX_STDIO` is refused at
   startup, because there is no listener to receive a transfer on.
 
-The staging directory must be writable by the server's user. The container image declares
-no volume for it, so mount a `tmpfs` or a volume when the plane is enabled — see
+The staging directory must be writable by the server's user and dedicated to one server
+instance — not a shared path such as `/tmp`. The container image declares no volume for
+it, so mount a `tmpfs` or a volume of its own when the plane is enabled; see
 [deployment](deployment.md#file-staging).
 
 `MATRIX_FILE_MAX_STAGED` bounds outstanding authorizations and staged transfers together,
