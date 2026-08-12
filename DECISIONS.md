@@ -126,3 +126,57 @@ restart every package. Whole-cycle tiling keeps that restart invisible: the wrap
 continues each region's motion by exactly one ordinary step, never a jump. For an
 unphased region the wrap falls in its idle gap; a phase can place it mid-crossing,
 where the glyphs are visible but still advance as if no seam existed.
+
+## Media is pushed to this server, never fetched by it
+
+The obvious way to accept media past the inline cap is to take a URL and fetch it. That
+is the confused-deputy pattern this server refuses: the caller chose the destination, the
+caller can be prompt-injected, and dereferencing it would make this server their user
+agent. The blast radius is small — the worst case is an attacker's picture on a wall —
+but it is the wrong design centre.
+
+The next-most-obvious alternative is to fetch only from an operator-configured transfer
+endpoint. That is better, and still wrong for this server: it means holding someone
+else's credential, having a destination that can be misconfigured, and owning an outbound
+HTTP client whose failure modes are ours.
+
+What actually ships inverts the direction. A trusted intermediary calls
+`files/authorizeUpload` on this server; this server mints a single-use ticket and returns
+a descriptor pointing at its own ingest route; the intermediary streams the bytes there.
+There is no fetch anywhere in the server, no credential held for anyone else's endpoint,
+and no destination to get wrong. It also needs no per-deployment transfer configuration
+beyond this server's own public origin, and it is what the draft file-transfer contract
+already expects an upstream to do.
+
+The cost is that the plane only works where this server is reachable over HTTPS at a
+hostname an intermediary can dial — which means it is unavailable under `--stdio`, and
+that combination is refused at startup rather than silently minting descriptors nothing
+can reach.
+
+## Nothing is advertised when the transfer plane is off
+
+An unconfigured server answers `files/authorizeUpload` with method-not-found and
+publishes a tool schema with no file annotation. Both are deliberate and are the same
+decision: a file-aware intermediary reads `-32601` as "this upstream has no native file
+transfer", so the absence *is* the advertisement, and a schema that annotated a file input
+the server would then refuse would be worse than saying nothing.
+
+That is also why the annotation is attached when the tool list is served rather than
+derived from the parameter type. The published contract has to follow the deployment, and
+an inline-only deployment must publish exactly what it published before this existed.
+
+## A staged reference is unguessable because nothing else authenticates it
+
+Ordinary asset and playback handles are a per-process token plus a counter, and are
+documented as an identifier namespace rather than a security boundary. A transfer
+credential cannot be that: authorization and consumption are separate requests, this
+server has no client authentication, and the ticket is the only thing linking them.
+
+Ticket identifiers and transfer credentials therefore come from the platform CSPRNG, the
+credential is stored hashed and compared in constant time, and it travels in a request
+header rather than the descriptor URL so it stays out of proxy access logs. An unknown
+ticket and a wrong credential return the same refusal, because distinguishing them would
+confirm which identifiers exist.
+
+None of that is a substitute for the operator's boundary. It bounds what a leaked
+descriptor is worth — one transfer, of one declared size and digest, for a few minutes.

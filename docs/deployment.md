@@ -43,7 +43,36 @@ choose a container memory limit without exercising concurrent decode and playbac
 configured canvas size.
 
 The decoder receives no inherited environment and cannot fetch a caller-selected URL.
-The MCP tool surface resolves only base64 `data:` URIs.
+The MCP tool surface resolves a base64 `data:` URI, and — when the transfer plane is
+enabled — a reference this server itself minted for bytes already in its own staging
+directory. Neither is a fetch: there is no code path that dereferences a destination a
+caller named.
+
+## File staging
+
+The transfer plane is off unless `MATRIX_FILE_PUBLIC_URL` is set. When it is enabled,
+bytes are pushed to this server rather than pulled by it: a trusted intermediary asks for
+an upload authorization, this server returns a single-use descriptor pointing at its own
+`PUT /files/upload/{id}` route, and the intermediary streams the media there. Only then
+does an ordinary `matrix_submit_asset` call name the staged source.
+
+That route rides the same listener as `/mcp`, so it sits behind whatever authenticated
+boundary and TLS termination already front the service. `MATRIX_FILE_PUBLIC_URL` must be
+the HTTPS origin clients reach that boundary at, and should be the same host `/mcp` is
+served on — an intermediary reuses its pinned MCP addresses only for a descriptor naming
+that host, and otherwise requires a publicly routable one.
+
+The staging directory needs to be writable, which the read-only root filesystem in the
+example Compose file does not provide by default. Mount a `tmpfs` sized for
+`MATRIX_FILE_MAX_STAGED` times the 64 MiB source ceiling, or point
+`MATRIX_FILE_STAGING_DIR` at the existing temporary `/tmp` mount and size that instead.
+Newly created staging directories are restricted to the server's user, as are the files
+in them.
+
+Transfer authority is single-use, expiring, and minted from the platform CSPRNG. It
+travels in a request header rather than the descriptor URL so it stays out of proxy
+access logs. It is transfer authority, not identity: this server still has no client
+authentication, and the operator still owns that boundary.
 
 ## Network requirements
 

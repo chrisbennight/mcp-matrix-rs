@@ -4,6 +4,7 @@
 //! stdio. The application has no client-authentication path and all callers share
 //! engine state.
 
+pub mod files;
 pub mod mcp;
 pub mod state;
 pub mod tools;
@@ -28,9 +29,14 @@ pub fn router(
     engine: Arc<Engine>,
     binaries: MediaBinaries,
     allowed_hosts: Vec<String>,
+    files: Option<Arc<files::FilePlane>>,
 ) -> axum::Router {
+    let handler_files = files.clone();
     let service = StreamableHttpService::new(
-        move || Ok(MatrixHandler::new(engine.clone(), binaries.clone())),
+        move || {
+            Ok(MatrixHandler::new(engine.clone(), binaries.clone())
+                .with_files(handler_files.clone()))
+        },
         LocalSessionManager::default().into(),
         // Stateless for every protocol version, not only for clients negotiating
         // 2026-07-28: this server keeps nothing per connection, so a session would be a
@@ -41,7 +47,17 @@ pub fn router(
             .with_allowed_hosts(allowed_hosts),
     );
 
-    axum::Router::new()
+    let mut app = axum::Router::new()
         .route("/healthz", axum::routing::get(|| async { "ok" }))
-        .nest_service("/mcp", service)
+        .nest_service("/mcp", service);
+
+    // The ingest route rides the same listener as `/mcp` deliberately. A trusted
+    // intermediary reuses the addresses it pinned for the MCP endpoint only when the
+    // transfer descriptor names that same host, so one shared origin is both the
+    // simplest arrangement and the best-supported one: the operator's existing TLS
+    // boundary and `Host` allowlist already cover it.
+    if let Some(plane) = files {
+        app = app.merge(files::ingest_router(plane));
+    }
+    app
 }

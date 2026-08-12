@@ -64,6 +64,32 @@ struct Args {
     )]
     allowed_hosts: Vec<String>,
 
+    /// Public HTTPS origin this server is reached at, which enables the transfer plane.
+    ///
+    /// Scheme and authority only, e.g. `https://panel.example.org`. Unset leaves the
+    /// server inline-only. A trusted intermediary dials this to deliver media too large
+    /// for a tool argument, and reuses the addresses it pinned for `/mcp` only when this
+    /// names that same host — so it should be the origin `/mcp` is already served on,
+    /// behind the operator's existing TLS boundary.
+    #[arg(long, env = "MATRIX_FILE_PUBLIC_URL")]
+    file_public_url: Option<String>,
+
+    /// Directory transfers are staged in. Created if absent; must be writable.
+    #[arg(
+        long,
+        env = "MATRIX_FILE_STAGING_DIR",
+        default_value = "/tmp/matrix-staging"
+    )]
+    file_staging_dir: std::path::PathBuf,
+
+    /// How long an unused authorization or an unconsumed staged transfer survives.
+    #[arg(long, env = "MATRIX_FILE_TTL_SECS", default_value_t = 300)]
+    file_ttl_secs: u64,
+
+    /// Ceiling on authorizations and staged transfers outstanding at once.
+    #[arg(long, env = "MATRIX_FILE_MAX_STAGED", default_value_t = 4)]
+    file_max_staged: usize,
+
     /// Probe a running instance on loopback and exit 0 or 1.
     #[arg(long)]
     healthcheck: bool,
@@ -128,6 +154,45 @@ async fn main() -> Result<()> {
         ffprobe: args.ffprobe_bin.clone(),
     };
 
+    // The plane needs a listener to receive on and a TLS boundary in front of it, and
+    // stdio has neither. Refusing the combination beats starting a server that mints
+    // descriptors nothing can reach.
+    if args.stdio && args.file_public_url.is_some() {
+        anyhow::bail!(
+            "--file-public-url needs the HTTP transport: under --stdio there is no \
+             listener to receive a transfer on"
+        );
+    }
+
+    let files = match &args.file_public_url {
+        None => None,
+        Some(origin) => {
+            let origin = matrix_server::files::validate_public_origin(origin)
+                .map_err(|e| anyhow::anyhow!("--file-public-url {e}"))?;
+            let plane = matrix_server::files::FilePlane::new(matrix_server::files::FileConfig {
+                public_origin: origin.clone(),
+                staging_dir: args.file_staging_dir.clone(),
+                ttl: Duration::from_secs(args.file_ttl_secs),
+                max_staged: args.file_max_staged,
+                // The decoder's own ceiling, so an over-size transfer is refused when it
+                // is authorized rather than after it has been moved.
+                max_source_bytes: matrix_media::Limits::default().max_source_bytes,
+            })
+            .await
+            .context("preparing the transfer staging directory")?;
+
+            // Without this, an authorization nobody redeems and a transfer nobody names
+            // hold their files until the process exits.
+            tokio::spawn(matrix_server::files::run_sweeper(plane.clone()));
+            tracing::info!(
+                origin = %origin,
+                staging = %args.file_staging_dir.display(),
+                "transfer plane enabled"
+            );
+            Some(plane)
+        }
+    };
+
     if args.stdio {
         use rmcp::ServiceExt;
 
@@ -150,7 +215,7 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    let app = matrix_server::router(engine.clone(), binaries, args.allowed_hosts.clone());
+    let app = matrix_server::router(engine.clone(), binaries, args.allowed_hosts.clone(), files);
 
     let listener = tokio::net::TcpListener::bind(args.listen)
         .await

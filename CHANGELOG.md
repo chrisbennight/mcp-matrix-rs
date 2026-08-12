@@ -6,6 +6,44 @@ All notable changes to this project are documented in this file. The format foll
 
 ## [Unreleased]
 
+### Added
+
+- A governed transfer plane, off by default and enabled by setting
+  `MATRIX_FILE_PUBLIC_URL` to the public HTTPS origin this server is reached at.
+  Media past the 16 KiB inline cap — GIFs and video, which by definition need a
+  downscale — now reaches the panel without passing through a tool argument or
+  model context. Bytes are pushed to this server, never fetched by it: a trusted
+  intermediary calls `files/authorizeUpload`, receives a single-use descriptor
+  pointing at this server's own `PUT /files/upload/{id}` route, streams the media
+  there, and a later `matrix_submit_asset` names the staged source. A reference
+  and an inline payload use the identical tool contract and return the identical
+  report.
+- Settings `MATRIX_FILE_STAGING_DIR`, `MATRIX_FILE_TTL_SECS`, and
+  `MATRIX_FILE_MAX_STAGED` bound where transfers are staged, how long an unused
+  authorization or unconsumed transfer survives, and how many may be outstanding.
+- Refusal codes for the transfer plane: `matrix_file_bad_credential`,
+  `matrix_file_unknown_ticket`, `matrix_file_expired`, `matrix_file_too_many_staged`,
+  `matrix_file_declared_too_large`, `matrix_file_size_mismatch`,
+  `matrix_file_digest_mismatch`, `matrix_file_unsupported_digest`,
+  `matrix_file_staging_failed`, and `matrix_file_bad_params`.
+
+### Changed
+
+- `matrix-media`'s decode entry points take a source handle rather than a byte
+  slice, so feeding the probe and the decoder no longer copies the source once per
+  subprocess, and a staged transfer streams from disk instead of being held in
+  memory. No limit value, refusal code, or ordering changed.
+
+### Security
+
+- Transfer authority is single-use, expiring, minted from the platform CSPRNG,
+  stored hashed, compared in constant time, and carried in a request header rather
+  than a URL. A transfer is bounded by what was declared and verified against what
+  arrived — byte count and SHA-256 — before it can be decoded, and the existing
+  `Limits` ceilings still apply. A caller-named URL of any scheme is still refused
+  with `matrix_unsupported_source`, including while the plane is configured; no
+  code path fetches a destination a caller chose.
+
 ## [0.3.0] - 2026-08-09
 
 ### Added
