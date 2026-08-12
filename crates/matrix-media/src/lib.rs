@@ -19,7 +19,9 @@ pub mod decode;
 pub mod ffmpeg;
 pub mod limits;
 
-pub use decode::{DEFAULT_FFMPEG_BIN, Probed, decode, preflight, probe_and_check_dimensions};
+pub use decode::{
+    DEFAULT_FFMPEG_BIN, Probed, Source, decode, preflight, probe_and_check_dimensions,
+};
 pub use limits::{LimitError, Limits};
 
 use matrix_frame::{Canvas, Frame, FrameError, FrameSequence, Rate};
