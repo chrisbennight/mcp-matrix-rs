@@ -93,7 +93,7 @@ impl Source {
                     Ok(())
                 }
                 Source::File(path) => match tokio::fs::File::open(&*path).await {
-                    Ok(file) => feed_bounded(file, &mut stdin, bound).await,
+                    Ok(file) => feed_bounded(file, &path, &mut stdin, bound).await,
                     Err(e) => Err(MediaError::Decoder(format!(
                         "could not open the source: {e}"
                     ))),
@@ -105,9 +105,17 @@ impl Source {
     }
 }
 
+/// A source that did not hold the byte count it was measured at.
+fn shortfall(available: u64, bound: u64) -> MediaError {
+    MediaError::Decoder(format!(
+        "source holds {available} of the {bound} bytes it was measured at"
+    ))
+}
+
 /// Stream at most `bound` bytes into a child, keeping the two failure kinds apart.
 async fn feed_bounded(
     file: tokio::fs::File,
+    path: &Path,
     stdin: &mut ChildStdin,
     bound: u64,
 ) -> Result<(), MediaError> {
@@ -126,15 +134,29 @@ async fn feed_bounded(
             return if delivered == bound {
                 Ok(())
             } else {
-                Err(MediaError::Decoder(format!(
-                    "source ended after {delivered} of {bound} measured bytes"
-                )))
+                Err(shortfall(delivered, bound))
             };
         }
         delivered += read as u64;
-        // The child stopping its read is ordinary; only the read side above is a failure.
         if stdin.write_all(&buf[..read]).await.is_err() {
-            return Ok(());
+            // The child stopped reading, which is ordinary — it had what it needed, and
+            // the frame-count ceilings judge what it produced. But it also leaves the
+            // rest of the source unread, so the check above never sees a shortfall.
+            // Re-measuring answers that in constant time; draining bytes the child has
+            // already refused would read a whole source to learn one number.
+            let available = tokio::fs::metadata(path)
+                .await
+                .map(|m| m.len())
+                .map_err(|e| {
+                    MediaError::Decoder(format!(
+                        "could not confirm the source after the decoder stopped reading: {e}"
+                    ))
+                })?;
+            return if available >= bound {
+                Ok(())
+            } else {
+                Err(shortfall(available, bound))
+            };
         }
     }
 }
@@ -1148,8 +1170,40 @@ mod tests {
 
         assert_eq!(err.code(), "media_decoder_failed");
         assert!(
-            err.to_string().contains("measured bytes"),
+            err.to_string().contains("was measured at"),
             "the refusal names the short read rather than the frame count: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_short_source_is_caught_even_when_the_decoder_stops_reading_first() {
+        // `true` exits without reading a byte, so the feeder's write fails before it ever
+        // reaches EOF and the shortfall check on the read path never runs. A child
+        // stopping early is ordinary on its own — the frame ceilings judge what it
+        // produced — but it must not become a way for a source that shrank to pass
+        // unnoticed.
+        let params = NormalizeParams {
+            canvas: Canvas::new(2, 2).expect("valid"),
+            ..params()
+        };
+        let frame = params.canvas.byte_len();
+        let staged = Staged::new("stopped-early", &vec![8u8; frame]);
+
+        let err = run_decoder_until(
+            &Source::file(staged.path()),
+            (frame * 3) as u64,
+            &params,
+            "true",
+            &[],
+            soon(),
+        )
+        .await
+        .expect_err("a shrunk source must not pass because the child lost interest");
+
+        assert_eq!(err.code(), "media_decoder_failed");
+        assert!(
+            err.to_string().contains("was measured at"),
+            "the refusal names the shortfall rather than the empty output: {err}"
         );
     }
 
