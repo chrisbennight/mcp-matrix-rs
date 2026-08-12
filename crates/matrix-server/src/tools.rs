@@ -78,20 +78,79 @@ pub struct FileValue {
     pub size: Option<u64>,
 }
 
-/// Bytes and a media type extracted from a reference.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ResolvedSource {
-    pub bytes: Vec<u8>,
-    pub media_type: String,
+/// A reference turned into something the decoder can read.
+///
+/// The staged variant owns its file: holding it across the decode is what keeps the
+/// bytes on disk, and dropping it afterwards is what removes them.
+#[derive(Debug)]
+pub enum ResolvedSource {
+    Inline { bytes: Vec<u8>, media_type: String },
+    Staged(crate::files::Staged),
 }
 
-/// Turn a reference into bytes.
+impl ResolvedSource {
+    pub fn media_type(&self) -> &str {
+        match self {
+            Self::Inline { media_type, .. } => media_type,
+            Self::Staged(staged) => &staged.media_type,
+        }
+    }
+
+    /// Bytes the source occupied, for the asset report. For a staged source that is what
+    /// the transfer plane received and verified, never what something declared.
+    pub fn byte_len(&self) -> u64 {
+        match self {
+            Self::Inline { bytes, .. } => bytes.len() as u64,
+            Self::Staged(staged) => staged.bytes,
+        }
+    }
+
+    #[cfg(test)]
+    fn inline_bytes(&self) -> &[u8] {
+        match self {
+            Self::Inline { bytes, .. } => bytes,
+            Self::Staged(_) => panic!("expected an inline source"),
+        }
+    }
+
+    fn for_decoder(&self) -> matrix_media::Source {
+        match self {
+            Self::Inline { bytes, .. } => matrix_media::Source::bytes(bytes),
+            Self::Staged(staged) => matrix_media::Source::file(staged.path()),
+        }
+    }
+}
+
+/// Turn a reference into something the decoder can read.
 ///
-/// Only `data:` URIs resolve here. Any other scheme is refused rather than fetched: the
-/// caller chose that destination, and dereferencing it would make this server their user
-/// agent. Resolving a non-inline reference belongs to a trusted transfer boundary,
-/// which is why the tool contract accepts one shape regardless of where the bytes came
-/// from.
+/// Two forms resolve and neither is fetched. A `data:` URI carries its own bytes. A
+/// reference this server minted for a completed transfer names bytes already sitting in
+/// its own staging directory, and is consumed single-use.
+///
+/// Everything else is refused rather than dereferenced: the caller chose that
+/// destination, and following it would make this server their user agent. No code path
+/// here opens a network connection or a caller-named path, whether or not the transfer
+/// plane is configured — a reference the plane did not mint is not a reference, and gets
+/// the same refusal as any other scheme. That also means an unrecognised staged-looking
+/// URI is indistinguishable from a nonsense one, so nothing here reveals which
+/// identifiers exist.
+pub async fn resolve_source(
+    value: &FileValue,
+    plane: Option<&Arc<crate::files::FilePlane>>,
+) -> Result<ResolvedSource, ToolError> {
+    if !value.uri.starts_with("data:")
+        && let Some(plane) = plane
+        && let Some(staged) = plane.take(&value.uri).await
+    {
+        return Ok(ResolvedSource::Staged(staged));
+    }
+    resolve_inline(value)
+}
+
+/// Turn an inline reference into bytes.
+///
+/// Only `data:` URIs resolve here; anything else gets the refusal [`resolve_source`]
+/// describes.
 pub fn resolve_inline(value: &FileValue) -> Result<ResolvedSource, ToolError> {
     let rest = value.uri.strip_prefix("data:").ok_or_else(|| {
         ToolError::UnsupportedSource(format!(
@@ -140,7 +199,7 @@ pub fn resolve_inline(value: &FileValue) -> Result<ResolvedSource, ToolError> {
         });
     }
 
-    Ok(ResolvedSource { bytes, media_type })
+    Ok(ResolvedSource::Inline { bytes, media_type })
 }
 
 #[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
@@ -210,10 +269,13 @@ pub async fn describe_device(engine: &Arc<Engine>) -> Result<DeviceReport, ToolE
 pub async fn submit_asset(
     engine: &Arc<Engine>,
     value: &FileValue,
+    plane: Option<&Arc<crate::files::FilePlane>>,
     ffmpeg_bin: &str,
     ffprobe_bin: &str,
 ) -> Result<AssetReport, ToolError> {
-    let source = resolve_inline(value)?;
+    // Held across the decode: a staged source owns its file, and dropping it is what
+    // removes the bytes. The asset that results says nothing about where they came from.
+    let source = resolve_source(value, plane).await?;
 
     let params = NormalizeParams {
         canvas: engine.canvas,
@@ -228,7 +290,7 @@ pub async fn submit_asset(
     let sequence = {
         let _slot = engine.acquire_decode_slot().await?;
         matrix_media::decode(
-            &matrix_media::Source::bytes(&source.bytes),
+            &source.for_decoder(),
             None,
             None,
             &params,
@@ -239,11 +301,7 @@ pub async fn submit_asset(
     };
 
     let asset = engine
-        .store_asset(
-            sequence,
-            source.bytes.len() as u64,
-            source.media_type.clone(),
-        )
+        .store_asset(sequence, source.byte_len(), source.media_type().to_string())
         .await;
 
     Ok(report_for(&asset))
@@ -735,8 +793,8 @@ mod tests {
     fn a_base64_data_uri_resolves_to_its_bytes() {
         let value = inline(&b64(b"hello"), "image/png;base64");
         let resolved = resolve_inline(&value).expect("resolves");
-        assert_eq!(resolved.bytes, b"hello");
-        assert_eq!(resolved.media_type, "image/png");
+        assert_eq!(resolved.inline_bytes(), b"hello");
+        assert_eq!(resolved.media_type(), "image/png");
     }
 
     #[test]
@@ -744,7 +802,7 @@ mod tests {
         let mut value = inline(&b64(b"x"), ";base64");
         value.mime_type = Some("image/gif".into());
         assert_eq!(
-            resolve_inline(&value).expect("resolves").media_type,
+            resolve_inline(&value).expect("resolves").media_type(),
             "image/gif"
         );
     }
@@ -789,7 +847,7 @@ mod tests {
     fn a_payload_at_the_inline_cap_is_accepted() {
         let value = inline(&b64(&vec![0u8; MAX_INLINE_BYTES]), "image/png;base64");
         let resolved = resolve_inline(&value).expect("at the cap");
-        assert_eq!(resolved.bytes.len(), MAX_INLINE_BYTES);
+        assert_eq!(resolved.inline_bytes().len(), MAX_INLINE_BYTES);
     }
 
     #[test]

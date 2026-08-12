@@ -32,10 +32,14 @@ and their reasoning. Read both before changing an architectural boundary.
 - `crates/matrix-text` rasterizes text into the same frame representation, including
   multi-region layouts of fixed and scrolling text.
 - `crates/matrix-server` owns the binary, MCP transport, tool dispatch, and shared
-  engine state.
+  engine state. Its `files` module owns the transfer plane: the upload authorization
+  method, the ingest route, and the staged sources a tool call consumes. Bytes are
+  pushed to this server and never fetched by it, and the plane is off unless an
+  operator configures a public origin.
 
 `smoke/expected-tools.txt` is the release catalog. The image smoke compares the exact
-advertised tool names against it.
+advertised tool names against it. The transfer plane is a method and a route, not a
+tool, so enabling it does not change that catalog.
 
 ## Commands
 
@@ -112,6 +116,7 @@ panel is supported without verified electrical and protocol evidence.
 ## Boundaries
 
 Do not commit secrets, production deployment files, or test code that makes live calls
-to a panel or shared network service. Do not dereference a caller-selected URL. A future
-artifact-transfer integration must resolve and authorize content before this server
-receives it, then preserve the existing decode limits.
+to a panel or shared network service. Do not dereference a caller-selected URL — the
+transfer plane does not change this, and adding a fetch would undo the reason it is
+shaped as a receiver. Content is authorized before it arrives, verified against what was
+declared once it has, and still decoded under the existing limits.

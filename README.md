@@ -90,8 +90,21 @@ An alert screen readable from across the room: incident header and count, affect
 - software power clamping before frames reach the panel
 - power, brightness, playback, asset, status, and device tools
 
-Media submitted through MCP is limited to a 16 KiB base64 `data:` URI. Larger-media
-transfer is planned; text and native-resolution still images fit within this limit.
+Media submitted in a tool argument is limited to a 16 KiB base64 `data:` URI, which fits
+text and native-resolution still images. Anything needing a downscale — a GIF or a video
+— is by definition larger, and reaches the panel through the transfer plane instead: a
+trusted intermediary obtains a single-use upload authorization, streams the media to this
+server directly, and a later `matrix_submit_asset` names the result. The bytes never
+appear in a tool argument or in model context.
+
+That plane is off unless `MATRIX_FILE_PUBLIC_URL` names the public HTTPS origin this
+server is reached at; unset, the server is inline-only exactly as before. It requires the
+HTTP transport, and the origin should be the one `/mcp` is already served on. See
+[configuration](docs/configuration.md#the-transfer-plane) and
+[deployment](docs/deployment.md#file-staging).
+
+This server never fetches a destination a caller named, whether or not the plane is
+configured.
 
 ## Status and non-goals
 
@@ -198,8 +211,9 @@ A typical session from the client:
    headroom before displaying content.
 2. `matrix_show_text` with `{"text": "HELLO"}` — text that fits shows as a centered
    still; longer text scrolls as a marquee until stopped.
-3. `matrix_submit_asset` with a base64 `data:` URI (16 KiB limit), then
-   `matrix_play` with the returned asset handle.
+3. `matrix_submit_asset` with a base64 `data:` URI (16 KiB limit) or with a reference an
+   intermediary staged through the transfer plane, then `matrix_play` with the returned
+   asset handle. Both forms use the same argument and return the same report.
 4. `matrix_stop` — the panel returns to its configured ambient behaviour.
 
 ### Tools

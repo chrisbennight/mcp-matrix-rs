@@ -25,11 +25,24 @@ pub struct MediaBinaries {
 pub struct MatrixHandler {
     engine: Arc<Engine>,
     binaries: MediaBinaries,
+    files: Option<Arc<crate::files::FilePlane>>,
 }
 
 impl MatrixHandler {
     pub fn new(engine: Arc<Engine>, binaries: MediaBinaries) -> Self {
-        Self { engine, binaries }
+        Self {
+            engine,
+            binaries,
+            files: None,
+        }
+    }
+
+    /// Serve the transfer plane too. Without it this server is inline-only and answers
+    /// the authorization method with method-not-found, which is what a file-aware
+    /// intermediary reads as "no native file transfer".
+    pub fn with_files(mut self, files: Option<Arc<crate::files::FilePlane>>) -> Self {
+        self.files = files;
+        self
     }
 }
 
@@ -149,9 +162,10 @@ impl MatrixHandler {
     #[tool(
         description = "Normalize media into frames the panel can display and hold it, \
                        returning an asset handle. Accepts a base64 data: URI up to 16 KiB \
-                       — content at or near the panel's resolution. Larger media needs an \
-                       artifact reference, which this server does not accept yet. Returns \
-                       the frame count and duration so a caller knows what it got without \
+                       — content at or near the panel's resolution. Larger media needs a \
+                       reference obtained through this server's file transfer, which is \
+                       available only where the operator has configured it. Returns the \
+                       frame count and duration so a caller knows what it got without \
                        playing it.",
         annotations(
             read_only_hint = false,
@@ -167,6 +181,7 @@ impl MatrixHandler {
         let report = tools::submit_asset(
             &self.engine,
             &source,
+            self.files.as_ref(),
             &self.binaries.ffmpeg,
             &self.binaries.ffprobe,
         )
@@ -330,6 +345,47 @@ impl MatrixHandler {
 /// constants.
 const TOOL_LIST_TTL_MS: u64 = 300_000;
 
+/// Mark `source` as a file-valued input, so an intermediary knows it may deliver one.
+///
+/// The annotation goes on the `source` subschema, which is the object shape this server
+/// has always accepted. `transferModes` names both paths deliberately: inline stays a
+/// first-class way to submit a small still, and the ceiling advertised here is the
+/// decoder's source ceiling rather than the inline cap, because the inline cap is a
+/// separate and much lower bound this server enforces itself.
+fn annotate_file_input(tool: &mut rmcp::model::Tool) {
+    let mut schema = (*tool.input_schema).clone();
+    let Some(source) = schema
+        .get_mut("properties")
+        .and_then(|p| p.get_mut("source"))
+        .and_then(|s| s.as_object_mut())
+    else {
+        // The schema is derived, so this cannot happen for a build that compiles; saying
+        // nothing is still better than publishing an annotation on the wrong property.
+        tracing::warn!("matrix_submit_asset has no source property to annotate");
+        return;
+    };
+
+    source.insert(
+        "x-mcp-file".into(),
+        serde_json::json!({
+            "transferModes": ["inline", "upload"],
+            "maxSize": matrix_media::Limits::default().max_source_bytes,
+        }),
+    );
+    tool.input_schema = Arc::new(schema);
+
+    // The prose has to agree with the annotation. A tool that declares an upload mode
+    // while telling callers references are unavailable is publishing two contracts.
+    tool.description = Some(
+        "Normalize media into frames the panel can display and hold it, returning an \
+         asset handle. Accepts a base64 data: URI up to 16 KiB — content at or near the \
+         panel's resolution — or a reference to media already delivered through this \
+         server's file transfer, which is how anything larger arrives. Returns the frame \
+         count and duration so a caller knows what it got without playing it."
+            .into(),
+    );
+}
+
 #[tool_handler(
     name = "matrix-server",
     version = "0.2.0",
@@ -340,6 +396,59 @@ const TOOL_LIST_TTL_MS: u64 = 300_000;
                     behaviour."
 )]
 impl ServerHandler for MatrixHandler {
+    /// Serve the draft's upload authorization when the transfer plane is configured.
+    ///
+    /// Everything else — including this method on an inline-only server — falls through
+    /// to the library's method-not-found. That answer is the contract: a file-aware
+    /// intermediary reads `-32601` as "this upstream has no native file transfer" and
+    /// stops asking, so an unconfigured deployment needs no advertisement to say so.
+    ///
+    /// The draft is unmerged, so its spellings live in one module rather than being
+    /// spread across the handler.
+    async fn on_custom_request(
+        &self,
+        request: rmcp::model::CustomRequest,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<rmcp::model::CustomResult, McpError> {
+        use crate::files::AuthorizeUploadParams;
+
+        if request.method != crate::files::AUTHORIZE_UPLOAD {
+            return Err(McpError::new(
+                rmcp::model::ErrorCode::METHOD_NOT_FOUND,
+                request.method,
+                None,
+            ));
+        }
+        let Some(files) = self.files.as_ref() else {
+            return Err(McpError::new(
+                rmcp::model::ErrorCode::METHOD_NOT_FOUND,
+                request.method,
+                None,
+            ));
+        };
+
+        // Absent params are an authorization with nothing declared, which is legitimate:
+        // every field of the draft's request is optional.
+        let params: AuthorizeUploadParams = match request.params {
+            None => AuthorizeUploadParams::default(),
+            Some(value) => serde_json::from_value(value).map_err(|e| {
+                McpError::new(
+                    rmcp::model::ErrorCode::INVALID_PARAMS,
+                    format!("matrix_file_bad_params: {e}"),
+                    Some(serde_json::json!({ "code": "matrix_file_bad_params" })),
+                )
+            })?,
+        };
+
+        let authorized = files
+            .authorize_upload(params)
+            .await
+            .map_err(|e| fail(&e, e.code()))?;
+        let value = serde_json::to_value(&authorized)
+            .map_err(|e| fail(e, "matrix_serialization_failed"))?;
+        Ok(rmcp::model::CustomResult::new(value))
+    }
+
     async fn list_tools(
         &self,
         _request: Option<PaginatedRequestParams>,
@@ -349,6 +458,18 @@ impl ServerHandler for MatrixHandler {
         // router yields registration order, which is stable per build but not sorted.
         let mut tools = Self::tool_router().list_all();
         tools.sort_by(|a, b| a.name.cmp(&b.name));
+
+        // The annotation is what makes an intermediary offer this tool a file at all, so
+        // it appears only where the transfer plane can actually receive one. An
+        // inline-only deployment therefore publishes exactly the schema it publishes
+        // today, rather than advertising a capability it would then refuse.
+        if self.files.is_some() {
+            for tool in &mut tools {
+                if tool.name == "matrix_submit_asset" {
+                    annotate_file_input(tool);
+                }
+            }
+        }
 
         Ok(ListToolsResult {
             tools,

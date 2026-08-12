@@ -30,6 +30,14 @@ asset is refused rather than shown degraded.
 formats. Decode runs out of process under a hard timeout and resource limits, with caps
 on source size, duration, dimensions, and normalized output.
 
+**Media arrives on a plane of its own, and is pushed rather than pulled.** Bytes past the
+inline cap never travel in a tool argument. A trusted intermediary asks this server for an
+upload authorization, this server mints a single-use descriptor pointing at its own ingest
+route, and the intermediary streams the media there; a later tool call names the staged
+source and gets an ordinary asset. Nothing dereferences a destination an MCP caller chose
+— that stays permanently out of scope — and the plane is off entirely unless an operator
+configures a public origin.
+
 **The device is protected in software.** Full-canvas luminance is clamped against the
 panel's reported ceiling. A HUB75 panel multiplexes, so full white across 4096 pixels
 draws around 3 A — at its rating rather than far past it — and the clamp exists for a
@@ -53,10 +61,11 @@ that expose it beyond loopback provide authentication and TLS at a trusted bound
 
 ## Future work
 
-**File plane consumption.** Accepting authorized artifact references instead of only
-inline bytes, so larger media reaches this server without passing through model context.
-Reference resolution belongs to a trusted transfer boundary; this server must not fetch
-a destination selected by an MCP caller.
+**Interoperable file inputs for direct clients.** The draft contract the transfer plane
+implements declares a file-valued tool input as a URI *string*; this server's `source` is
+an object, which the operator's intermediary translates but a plain draft client would not
+understand. Accepting both shapes would make the plane usable without an intermediary in
+front of it.
 
 **Contention arbitration.** Priority, deduplication, duration caps, preemption, and the
 scheduler that would apply them. `Playout` drives one sequence at a time and holds it

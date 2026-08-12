@@ -270,12 +270,35 @@ impl WireServer {
         .await
     }
 
+    async fn start_with_files(
+        engine: std::sync::Arc<Engine>,
+        binaries: MediaBinaries,
+        files: std::sync::Arc<matrix_server::files::FilePlane>,
+    ) -> Self {
+        Self::assemble(
+            engine,
+            binaries,
+            vec!["localhost".into(), "127.0.0.1".into(), "::1".into()],
+            Some(files),
+        )
+        .await
+    }
+
     async fn start_with_allowed_hosts(
         engine: std::sync::Arc<Engine>,
         binaries: MediaBinaries,
         allowed_hosts: Vec<String>,
     ) -> Self {
-        let app = matrix_server::router(engine, binaries, allowed_hosts);
+        Self::assemble(engine, binaries, allowed_hosts, None).await
+    }
+
+    async fn assemble(
+        engine: std::sync::Arc<Engine>,
+        binaries: MediaBinaries,
+        allowed_hosts: Vec<String>,
+        files: Option<std::sync::Arc<matrix_server::files::FilePlane>>,
+    ) -> Self {
+        let app = matrix_server::router(engine, binaries, allowed_hosts, files);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind");
@@ -334,6 +357,24 @@ impl WireServer {
         )
         .await
     }
+}
+
+/// A transfer plane staging into a scratch directory this test owns.
+async fn wire_plane(name: &str) -> std::sync::Arc<matrix_server::files::FilePlane> {
+    matrix_server::files::FilePlane::new(matrix_server::files::FileConfig {
+        // The origin an intermediary would dial. The test dials the real listener
+        // instead, because a loopback test server has no certificate for this name —
+        // what is under test is the plumbing, not TLS termination, which is the
+        // operator's boundary.
+        public_origin: "https://panel.example".into(),
+        staging_dir: std::env::temp_dir()
+            .join(format!("matrix-wire-files-{}-{name}", std::process::id())),
+        ttl: std::time::Duration::from_secs(60),
+        max_staged: 4,
+        max_source_bytes: 64 * 1024 * 1024,
+    })
+    .await
+    .expect("plane")
 }
 
 /// Text payload of a tool result, parsed as the JSON the tools emit.
@@ -808,4 +849,299 @@ async fn the_host_allowlist_admits_the_dialed_authority_and_refuses_others() {
         reqwest::StatusCode::FORBIDDEN,
         "an authority outside the allowlist is refused"
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn media_past_the_inline_cap_reaches_the_panel_by_reference() {
+    use sha2::Digest as _;
+
+    let panel = UdpSocket::bind("127.0.0.1:0").await.expect("bind panel");
+    let panel_addr = panel.local_addr().expect("panel addr");
+    let base = fake_panel(PANEL_INFO);
+    let scratch = std::env::temp_dir().join(format!("matrix-ref-{}", std::process::id()));
+    std::fs::create_dir_all(&scratch).expect("scratch");
+    let binaries = stand_in_binaries(&scratch);
+
+    let engine = Engine::new(
+        canvas(),
+        Rate::new(25).expect("rate"),
+        matrix_device::WledClient::new(base, Duration::from_millis(500)).expect("client"),
+        panel_addr,
+    );
+    let plane = wire_plane("roundtrip").await;
+    let server = WireServer::start_with_files(engine, binaries, plane).await;
+
+    // Four times the inline cap: this payload cannot be submitted as a tool argument at
+    // all, which is the whole reason the transfer plane exists.
+    let payload = vec![0xA5u8; matrix_server::tools::MAX_INLINE_BYTES * 4];
+    let digest =
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(sha2::Sha256::digest(&payload));
+
+    let authorized = server
+        .rpc(
+            "files/authorizeUpload",
+            None,
+            // Deliberately declares no size. The report's byte count can then only have
+            // come from counting what arrived, not from echoing a declaration back.
+            serde_json::json!({
+                "name": "clip.gif",
+                "mimeType": "image/gif",
+                "digest": { "algorithm": "sha-256", "value": digest },
+            }),
+        )
+        .await;
+    let result = &authorized["result"];
+    assert_eq!(result["upload"]["transport"], "https", "{authorized}");
+    assert_eq!(result["upload"]["method"], "PUT");
+
+    let uri = result["file"]["uri"]
+        .as_str()
+        .expect("staged uri")
+        .to_string();
+    let credential = result["upload"]["headers"][matrix_server::files::TRANSFER_CREDENTIAL_HEADER]
+        .as_str()
+        .expect("credential")
+        .to_string();
+    assert!(
+        !result["upload"]["url"]
+            .as_str()
+            .expect("url")
+            .contains(&credential),
+        "the credential must never appear in the descriptor URL"
+    );
+    assert!(
+        result["upload"]["headers"]["Authorization"].is_null(),
+        "Authorization stays free for whatever boundary fronts this route"
+    );
+
+    // The intermediary streams the bytes to the descriptor. It would dial the configured
+    // origin; the test dials the listener that origin fronts.
+    // The path the descriptor names, which is deliberately not the reference the tool
+    // call redeems — that one must not be derivable from a URL a proxy logs.
+    let id = result["upload"]["url"]
+        .as_str()
+        .expect("url")
+        .rsplit('/')
+        .next()
+        .expect("upload identifier");
+    assert!(
+        !uri.contains(id),
+        "the staged reference must not be derivable from the upload URL"
+    );
+    let upload = server
+        .client
+        .put(format!("{}/files/upload/{id}", server.base))
+        .header(
+            matrix_server::files::TRANSFER_CREDENTIAL_HEADER,
+            &credential,
+        )
+        .body(payload.clone())
+        .send()
+        .await
+        .expect("upload");
+    assert_eq!(
+        upload.status().as_u16(),
+        204,
+        "transfer accepted with no body"
+    );
+
+    // From here it is an ordinary submission. Nothing downstream knows the difference.
+    let submitted = server
+        .call_tool(
+            "matrix_submit_asset",
+            serde_json::json!({ "source": { "uri": uri } }),
+        )
+        .await;
+    let by_reference = tool_payload(&submitted);
+    assert_eq!(
+        by_reference["source_bytes"].as_u64(),
+        Some(payload.len() as u64),
+        "nothing declared a size, so this count came from the bytes: {by_reference}"
+    );
+    assert_eq!(by_reference["media_type"], "image/gif");
+    assert_eq!(by_reference["frames"].as_u64(), Some(3));
+
+    // Same contract, same report shape as an inline submission.
+    let inline = tool_payload(
+        &server
+            .call_tool(
+                "matrix_submit_asset",
+                serde_json::json!({
+                    "source": { "uri": format!("data:image/gif;base64,{}", base64::engine::general_purpose::STANDARD.encode(b"tiny")) }
+                }),
+            )
+            .await,
+    );
+    let shape = |report: &serde_json::Value| {
+        let mut keys: Vec<String> = report
+            .as_object()
+            .expect("report object")
+            .keys()
+            .cloned()
+            .collect();
+        keys.sort();
+        keys
+    };
+    assert_eq!(
+        shape(&by_reference),
+        shape(&inline),
+        "a reference and an inline submission must report identically"
+    );
+
+    // The staged bytes are consumed: the same reference cannot be replayed.
+    let replayed = server
+        .call_tool(
+            "matrix_submit_asset",
+            serde_json::json!({ "source": { "uri": uri } }),
+        )
+        .await;
+    assert_eq!(
+        replayed["error"]["data"]["code"], "matrix_unsupported_source",
+        "a spent reference is just an unrecognised one: {replayed}"
+    );
+
+    let _ = std::fs::remove_dir_all(&scratch);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_caller_named_url_is_refused_while_the_transfer_plane_is_configured() {
+    let panel = UdpSocket::bind("127.0.0.1:0").await.expect("bind panel");
+    let panel_addr = panel.local_addr().expect("panel addr");
+    let base = fake_panel(PANEL_INFO);
+    let scratch = std::env::temp_dir().join(format!("matrix-refuse-{}", std::process::id()));
+    std::fs::create_dir_all(&scratch).expect("scratch");
+    let binaries = stand_in_binaries(&scratch);
+
+    let engine = Engine::new(
+        canvas(),
+        Rate::new(25).expect("rate"),
+        matrix_device::WledClient::new(base, Duration::from_millis(500)).expect("client"),
+        panel_addr,
+    );
+    let server = WireServer::start_with_files(engine, binaries, wire_plane("refuse").await).await;
+
+    // Having a transfer plane must not turn this server into anyone's user agent.
+    for uri in [
+        "https://example.invalid/clip.gif",
+        "http://127.0.0.1:1/clip.gif",
+        "file:///etc/passwd",
+        "matrix-file://staged/fabricated-identifier",
+    ] {
+        let response = server
+            .call_tool(
+                "matrix_submit_asset",
+                serde_json::json!({ "source": { "uri": uri } }),
+            )
+            .await;
+        assert_eq!(
+            response["error"]["data"]["code"], "matrix_unsupported_source",
+            "{uri} must be refused: {response}"
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&scratch);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_inline_only_server_advertises_and_answers_exactly_as_before() {
+    let panel = UdpSocket::bind("127.0.0.1:0").await.expect("bind panel");
+    let panel_addr = panel.local_addr().expect("panel addr");
+    let base = fake_panel(PANEL_INFO);
+    let scratch = std::env::temp_dir().join(format!("matrix-off-{}", std::process::id()));
+    std::fs::create_dir_all(&scratch).expect("scratch");
+    let binaries = stand_in_binaries(&scratch);
+
+    let engine = Engine::new(
+        canvas(),
+        Rate::new(25).expect("rate"),
+        matrix_device::WledClient::new(base, Duration::from_millis(500)).expect("client"),
+        panel_addr,
+    );
+    let server = WireServer::start(engine, binaries).await;
+
+    // Method-not-found is the contract: a file-aware intermediary reads -32601 as "no
+    // native file transfer here" and stops asking.
+    let authorized = server
+        .rpc("files/authorizeUpload", None, serde_json::json!({}))
+        .await;
+    assert_eq!(
+        authorized["error"]["code"].as_i64(),
+        Some(-32601),
+        "{authorized}"
+    );
+
+    // And the published contract says nothing about files, so nothing offers one.
+    let listed = server.rpc("tools/list", None, serde_json::json!({})).await;
+    let submit = listed["result"]["tools"]
+        .as_array()
+        .expect("tools")
+        .iter()
+        .find(|t| t["name"] == "matrix_submit_asset")
+        .expect("submit tool")
+        .clone();
+    assert!(
+        submit["inputSchema"]["properties"]["source"]["x-mcp-file"].is_null(),
+        "an inline-only server must not advertise a file input: {submit}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_configured_server_advertises_the_file_input_on_its_source_property() {
+    let panel = UdpSocket::bind("127.0.0.1:0").await.expect("bind panel");
+    let panel_addr = panel.local_addr().expect("panel addr");
+    let base = fake_panel(PANEL_INFO);
+    let scratch = std::env::temp_dir().join(format!("matrix-adv-{}", std::process::id()));
+    std::fs::create_dir_all(&scratch).expect("scratch");
+    let binaries = stand_in_binaries(&scratch);
+
+    let engine = Engine::new(
+        canvas(),
+        Rate::new(25).expect("rate"),
+        matrix_device::WledClient::new(base, Duration::from_millis(500)).expect("client"),
+        panel_addr,
+    );
+    let server = WireServer::start_with_files(engine, binaries, wire_plane("advert").await).await;
+
+    let listed = server.rpc("tools/list", None, serde_json::json!({})).await;
+    let submit = listed["result"]["tools"]
+        .as_array()
+        .expect("tools")
+        .iter()
+        .find(|t| t["name"] == "matrix_submit_asset")
+        .expect("submit tool")
+        .clone();
+    let annotation = &submit["inputSchema"]["properties"]["source"]["x-mcp-file"];
+
+    // Both modes: a reference is now possible and inline stays a first-class way to
+    // submit a small still.
+    assert_eq!(
+        annotation["transferModes"],
+        serde_json::json!(["inline", "upload"]),
+        "{submit}"
+    );
+    // The advertised ceiling is the decoder's source ceiling, which is what a transfer
+    // is actually bounded by.
+    assert_eq!(
+        annotation["maxSize"].as_u64(),
+        Some(matrix_media::Limits::default().max_source_bytes),
+    );
+
+    // The catalog itself is unchanged: the transfer plane is a method, not a tool.
+    let names: Vec<&str> = listed["result"]["tools"]
+        .as_array()
+        .expect("tools")
+        .iter()
+        .map(|t| t["name"].as_str().expect("name"))
+        .collect();
+    let expected: Vec<String> = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../smoke/expected-tools.txt"),
+    )
+    .expect("catalog")
+    .lines()
+    .map(|l| l.trim().to_string())
+    .filter(|l| !l.is_empty())
+    .collect();
+    assert_eq!(names, expected, "the advertised catalog must not change");
+
+    let _ = std::fs::remove_dir_all(&scratch);
 }

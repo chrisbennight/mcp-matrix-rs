@@ -34,6 +34,14 @@ serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 schemars = "1"
 base64 = "0.22"
+# The transfer plane: SHA-256 to verify a declared digest against what arrived, the
+# platform CSPRNG for transfer credentials, and a constant-time compare for both.
+sha2 = "0.10"
+getrandom = "0.4"
+subtle = "2"
+bytes = "1"
+url = "2"
+futures-util = { version = "0.3", default-features = false }
 clap = { version = "4", features = ["derive", "env"] }
 thiserror.workspace = true
 anyhow = "1"
@@ -42,3 +50,5 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
+# The wire test declares a real digest, so it hashes the payload the way a caller would.
+sha2 = "0.10"
