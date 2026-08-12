@@ -881,10 +881,11 @@ async fn media_past_the_inline_cap_reaches_the_panel_by_reference() {
         .rpc(
             "files/authorizeUpload",
             None,
+            // Deliberately declares no size. The report's byte count can then only have
+            // come from counting what arrived, not from echoing a declaration back.
             serde_json::json!({
                 "name": "clip.gif",
                 "mimeType": "image/gif",
-                "size": payload.len(),
                 "digest": { "algorithm": "sha-256", "value": digest },
             }),
         )
@@ -939,7 +940,7 @@ async fn media_past_the_inline_cap_reaches_the_panel_by_reference() {
     assert_eq!(
         by_reference["source_bytes"].as_u64(),
         Some(payload.len() as u64),
-        "the report carries what arrived, not what was declared: {by_reference}"
+        "nothing declared a size, so this count came from the bytes: {by_reference}"
     );
     assert_eq!(by_reference["media_type"], "image/gif");
     assert_eq!(by_reference["frames"].as_u64(), Some(3));

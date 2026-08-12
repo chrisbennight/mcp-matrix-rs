@@ -21,11 +21,15 @@ All notable changes to this project are documented in this file. The format foll
 - Settings `MATRIX_FILE_STAGING_DIR`, `MATRIX_FILE_TTL_SECS`, and
   `MATRIX_FILE_MAX_STAGED` bound where transfers are staged, how long an unused
   authorization or unconsumed transfer survives, and how many may be outstanding.
-- Refusal codes for the transfer plane: `matrix_file_bad_credential`,
-  `matrix_file_unknown_ticket`, `matrix_file_expired`, `matrix_file_too_many_staged`,
-  `matrix_file_declared_too_large`, `matrix_file_size_mismatch`,
-  `matrix_file_digest_mismatch`, `matrix_file_unsupported_digest`,
-  `matrix_file_staging_failed`, and `matrix_file_bad_params`.
+- Refusal codes for the transfer plane: `matrix_file_unauthorized`,
+  `matrix_file_too_many_staged`, `matrix_file_declared_too_large`,
+  `matrix_file_size_mismatch`, `matrix_file_digest_mismatch`,
+  `matrix_file_unsupported_digest`, `matrix_file_staging_failed`, and
+  `matrix_file_bad_params`. Every way of failing to present valid transfer
+  authority — an unknown identifier, a wrong credential, an expired or already
+  used one — answers with the single `matrix_file_unauthorized`, so a caller
+  cannot learn which identifiers exist. The operator's log keeps the precise
+  reason.
 
 ### Changed
 

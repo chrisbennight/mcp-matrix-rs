@@ -162,9 +162,10 @@ impl MatrixHandler {
     #[tool(
         description = "Normalize media into frames the panel can display and hold it, \
                        returning an asset handle. Accepts a base64 data: URI up to 16 KiB \
-                       — content at or near the panel's resolution. Larger media needs an \
-                       artifact reference, which this server does not accept yet. Returns \
-                       the frame count and duration so a caller knows what it got without \
+                       — content at or near the panel's resolution. Larger media needs a \
+                       reference obtained through this server's file transfer, which is \
+                       available only where the operator has configured it. Returns the \
+                       frame count and duration so a caller knows what it got without \
                        playing it.",
         annotations(
             read_only_hint = false,
@@ -372,6 +373,17 @@ fn annotate_file_input(tool: &mut rmcp::model::Tool) {
         }),
     );
     tool.input_schema = Arc::new(schema);
+
+    // The prose has to agree with the annotation. A tool that declares an upload mode
+    // while telling callers references are unavailable is publishing two contracts.
+    tool.description = Some(
+        "Normalize media into frames the panel can display and hold it, returning an \
+         asset handle. Accepts a base64 data: URI up to 16 KiB — content at or near the \
+         panel's resolution — or a reference to media already delivered through this \
+         server's file transfer, which is how anything larger arrives. Returns the frame \
+         count and duration so a caller knows what it got without playing it."
+            .into(),
+    );
 }
 
 #[tool_handler(

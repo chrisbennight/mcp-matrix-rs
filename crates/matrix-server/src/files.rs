@@ -84,10 +84,21 @@ impl FileError {
         }
     }
 
-    /// HTTP status for the ingest route.
+    /// The code the ingest route puts on the wire.
     ///
-    /// An unknown ticket and a bad credential deliberately share a status and carry no
-    /// distinguishing detail: telling them apart would confirm that an identifier exists.
+    /// Every way of failing to present valid authority collapses to one value. The
+    /// internal codes stay distinct for the operator's log, but a caller must not be
+    /// able to tell a live authorization it guessed wrong from one that never existed,
+    /// was already used, or has expired — each of those answers is an oracle for which
+    /// identifiers are real.
+    pub fn public_code(&self) -> &'static str {
+        match self {
+            Self::UnknownTicket | Self::BadCredential | Self::Expired => "matrix_file_unauthorized",
+            other => other.code(),
+        }
+    }
+
+    /// HTTP status for the ingest route.
     pub fn http_status(&self) -> axum::http::StatusCode {
         use axum::http::StatusCode;
         match self {
@@ -163,10 +174,23 @@ struct Ticket {
     credential_hash: [u8; 32],
     partial: PathBuf,
     final_path: PathBuf,
-    declared_size: u64,
+    /// The exact size to verify against, present only when the caller stated one.
+    declared_size: Option<u64>,
+    /// What may be streamed at most, always present. Equals `declared_size` when there
+    /// is one and the source ceiling otherwise.
+    ceiling: u64,
     declared_digest: Option<[u8; 32]>,
     media_type: String,
     expires_at: Instant,
+}
+
+/// Whether an authorization is waiting for its transfer or already running one.
+///
+/// Both occupy a slot. An in-flight transfer that vanished from this map would be
+/// counted by nothing while still holding a partial file and a connection.
+enum TicketState {
+    Idle(Ticket),
+    InFlight,
 }
 
 impl Drop for Ticket {
@@ -216,7 +240,7 @@ pub struct FileConfig {
 
 pub struct FilePlane {
     config: FileConfig,
-    tickets: Mutex<HashMap<String, Ticket>>,
+    tickets: Mutex<HashMap<String, TicketState>>,
     staged: Mutex<HashMap<String, Staged>>,
 }
 
@@ -227,20 +251,32 @@ pub struct FilePlane {
 /// a plaintext origin is refused outright. Failing at startup beats minting descriptors
 /// that every transfer rejects.
 pub fn validate_public_origin(origin: &str) -> Result<String, String> {
-    let trimmed = origin.trim_end_matches('/');
-    let rest = trimmed
-        .strip_prefix("https://")
-        .ok_or_else(|| format!("must be an https:// origin, got {origin:?}"))?;
-    if rest.is_empty() {
+    // Parsed rather than pattern-matched. Prefix and character checks admit strings that
+    // look like origins without naming one — `https://:` and `https://[::1` among them —
+    // and the first sign of that would be an intermediary refusing every descriptor.
+    let parsed = url::Url::parse(origin).map_err(|e| format!("is not a URL: {e}"))?;
+
+    if parsed.scheme() != "https" {
+        return Err(format!("must use https, got {:?}", parsed.scheme()));
+    }
+    if parsed.host_str().is_none_or(str::is_empty) {
         return Err("must name a host".into());
     }
-    if rest.contains('@') {
+    if !parsed.username().is_empty() || parsed.password().is_some() {
         return Err("must not carry userinfo".into());
     }
-    if rest.contains('/') || rest.contains('?') || rest.contains('#') {
+    if !matches!(parsed.path(), "" | "/") || parsed.query().is_some() || parsed.fragment().is_some()
+    {
         return Err("must be an origin only, with no path, query, or fragment".into());
     }
-    Ok(trimmed.to_string())
+
+    // Rebuilt from the parse so the stored value is exactly what descriptors are built
+    // from, with any default port and trailing slash normalised away.
+    let host = parsed.host_str().expect("checked above");
+    Ok(match parsed.port() {
+        Some(port) => format!("https://{host}:{port}"),
+        None => format!("https://{host}"),
+    })
 }
 
 fn random_token() -> String {
@@ -283,15 +319,20 @@ impl FilePlane {
         params: AuthorizeUploadParams,
     ) -> Result<AuthorizeUploadResult, FileError> {
         // A size the decoder would refuse costs nothing to refuse now, before any bytes
-        // are moved. An undeclared size gets the ceiling itself, so the ingest still has
-        // a bound to stream against.
-        let declared_size = params.size.unwrap_or(self.config.max_source_bytes);
-        if declared_size > self.config.max_source_bytes {
+        // are moved. Declaring one is optional in the draft, so its two jobs are kept
+        // apart: `ceiling` always bounds what may be streamed, and `declared_size` is an
+        // exact figure to verify against only when the caller actually stated one.
+        // Collapsing them would authorize an undeclared transfer and then refuse it
+        // unless it happened to be exactly the ceiling.
+        if let Some(declared) = params.size
+            && declared > self.config.max_source_bytes
+        {
             return Err(FileError::DeclaredTooLarge {
-                declared: declared_size,
+                declared,
                 limit: self.config.max_source_bytes,
             });
         }
+        let ceiling = params.size.unwrap_or(self.config.max_source_bytes);
 
         let declared_digest = match &params.digest {
             None => None,
@@ -304,17 +345,6 @@ impl FilePlane {
                 Some(decode_digest(&digest.value)?)
             }
         };
-
-        {
-            let staged = self.staged.lock().await;
-            let tickets = self.tickets.lock().await;
-            let outstanding = staged.len() + tickets.len();
-            if outstanding >= self.config.max_staged {
-                return Err(FileError::TooManyStaged {
-                    staged: outstanding,
-                });
-            }
-        }
 
         let id = random_token();
         let credential = random_token();
@@ -330,14 +360,30 @@ impl FilePlane {
             credential_hash: sha256(credential.as_bytes()),
             partial: self.config.staging_dir.join(format!("{id}.part")),
             final_path: self.config.staging_dir.join(&id),
-            declared_size,
+            declared_size: params.size,
+            ceiling,
             declared_digest,
             media_type: media_type.clone(),
             expires_at: Instant::now() + self.config.ttl,
         };
 
+        // Counted and inserted without releasing the lock in between. Checking the
+        // ceiling and then re-acquiring would let concurrent authorizations all observe
+        // the same pre-insert count and all pass, which is how a bound on outstanding
+        // work turns into no bound at all. Lock order is tickets-then-staged everywhere.
+        {
+            let mut tickets = self.tickets.lock().await;
+            let staged = self.staged.lock().await;
+            let outstanding = tickets.len() + staged.len();
+            if outstanding >= self.config.max_staged {
+                return Err(FileError::TooManyStaged {
+                    staged: outstanding,
+                });
+            }
+            tickets.insert(id.clone(), TicketState::Idle(ticket));
+        }
+
         let url = format!("{}/files/upload/{id}", self.config.public_origin);
-        self.tickets.lock().await.insert(id.clone(), ticket);
 
         let mut headers = HashMap::new();
         headers.insert("Authorization".to_string(), format!("Bearer {credential}"));
@@ -366,14 +412,24 @@ impl FilePlane {
         })
     }
 
-    /// Claim an authorization, verifying the credential before consuming it.
+    /// Claim an authorization, verifying the credential before taking it in flight.
     ///
-    /// Look-up, verification, and removal happen under one lock so two concurrent
-    /// transfers cannot both claim the same authorization, and so a wrong credential
-    /// cannot burn one.
+    /// Look-up, verification, and the transition happen under one lock, so two concurrent
+    /// transfers cannot both claim one authorization and a wrong credential cannot burn
+    /// one.
+    ///
+    /// The entry is left behind as [`TicketState::InFlight`] rather than removed. A
+    /// removed entry would be counted by nothing while its transfer was still running,
+    /// so a caller could authorize, begin a slow upload to free the slot, and repeat —
+    /// accumulating partial files and connections that `max_staged` was supposed to
+    /// bound.
     async fn claim(&self, id: &str, credential: &str) -> Result<Ticket, FileError> {
         let mut tickets = self.tickets.lock().await;
-        let ticket = tickets.get(id).ok_or(FileError::UnknownTicket)?;
+        let Some(TicketState::Idle(ticket)) = tickets.get(id) else {
+            // A transfer already in flight is not claimable twice, and says the same
+            // thing to a caller as one that never existed.
+            return Err(FileError::UnknownTicket);
+        };
 
         let presented = sha256(credential.as_bytes());
         // Constant time: a byte-by-byte comparison leaks the prefix length of a guess.
@@ -387,7 +443,15 @@ impl FilePlane {
             return Err(FileError::Expired);
         }
 
-        Ok(tickets.remove(id).expect("looked up under this lock"))
+        match tickets.insert(id.to_string(), TicketState::InFlight) {
+            Some(TicketState::Idle(ticket)) => Ok(ticket),
+            _ => unreachable!("the idle ticket was matched under this lock"),
+        }
+    }
+
+    /// Release an in-flight slot once its transfer has finished, however it finished.
+    async fn release(&self, id: &str) {
+        self.tickets.lock().await.remove(id);
     }
 
     /// Receive one transfer's bytes and stage them if they are what was declared.
@@ -399,6 +463,31 @@ impl FilePlane {
         &self,
         id: &str,
         credential: &str,
+        chunks: S,
+    ) -> Result<(), FileError>
+    where
+        S: futures_util::Stream<Item = Result<bytes::Bytes, E>> + Unpin,
+        E: std::fmt::Display,
+    {
+        let ticket = self.claim(id, credential).await?;
+
+        // Bounded in time as well as in bytes. A transfer that stalls forever would
+        // otherwise hold its slot forever, and enough of those wedge the plane for
+        // everyone; the same window that expires an unused authorization applies here.
+        let outcome = tokio::time::timeout(self.config.ttl, self.stream_into(id, &ticket, chunks))
+            .await
+            .unwrap_or(Err(FileError::Expired));
+
+        // However it ended, the slot is returned. On success `stream_into` has already
+        // recorded the staged source, which is what the slot becomes.
+        self.release(id).await;
+        outcome
+    }
+
+    async fn stream_into<S, E>(
+        &self,
+        id: &str,
+        ticket: &Ticket,
         mut chunks: S,
     ) -> Result<(), FileError>
     where
@@ -406,8 +495,6 @@ impl FilePlane {
         E: std::fmt::Display,
     {
         use futures_util::StreamExt as _;
-
-        let ticket = self.claim(id, credential).await?;
 
         let mut file = tokio::fs::File::create(&ticket.partial)
             .await
@@ -420,11 +507,12 @@ impl FilePlane {
             let chunk = chunk.map_err(|e| FileError::Staging(format!("reading the body: {e}")))?;
             written = written.saturating_add(chunk.len() as u64);
             // Checked as the bytes arrive rather than afterwards: a declared length is a
-            // claim, and a body that exceeds it must stop costing disk immediately.
-            if written > ticket.declared_size {
+            // claim, and a body that exceeds what was authorized must stop costing disk
+            // immediately. Undeclared transfers are bounded by the source ceiling.
+            if written > ticket.ceiling {
                 return Err(FileError::SizeMismatch {
                     actual: written,
-                    declared: ticket.declared_size,
+                    declared: ticket.ceiling,
                 });
             }
             hasher.update(&chunk);
@@ -438,10 +526,13 @@ impl FilePlane {
             .map_err(|e| FileError::Staging(format!("flushing the staged file: {e}")))?;
         drop(file);
 
-        if written != ticket.declared_size {
+        // An exact match is required only against a size the caller actually stated.
+        if let Some(declared) = ticket.declared_size
+            && written != declared
+        {
             return Err(FileError::SizeMismatch {
                 actual: written,
-                declared: ticket.declared_size,
+                declared,
             });
         }
         if let Some(expected) = ticket.declared_digest {
@@ -489,7 +580,12 @@ impl FilePlane {
     pub async fn sweep(&self) {
         let now = Instant::now();
         let ttl = self.config.ttl;
-        self.tickets.lock().await.retain(|_, t| now <= t.expires_at);
+        self.tickets.lock().await.retain(|_, state| match state {
+            // An in-flight transfer is bounded by its own receive deadline, not by this
+            // sweep: collecting it here would unlink a partial file still being written.
+            TicketState::InFlight => true,
+            TicketState::Idle(ticket) => now <= ticket.expires_at,
+        });
         self.staged
             .lock()
             .await
@@ -564,9 +660,10 @@ async fn ingest(
     use axum::response::IntoResponse as _;
 
     let Some(credential) = bearer(&headers) else {
-        // Same answer as a bad credential: distinguishing them would confirm which
-        // identifiers exist.
-        return refusal(StatusCode::FORBIDDEN, "matrix_file_bad_credential");
+        return refusal(
+            StatusCode::FORBIDDEN,
+            FileError::BadCredential.public_code(),
+        );
     };
 
     // `id` is only ever a map key. The path a transfer writes to was minted with the
@@ -579,8 +676,9 @@ async fn ingest(
         // No body, and deliberately nothing about where the bytes went.
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => {
+            // The operator's log keeps the precise reason; the caller gets the bounded one.
             tracing::warn!(code = e.code(), "refused a transfer");
-            refusal(e.http_status(), e.code())
+            refusal(e.http_status(), e.public_code())
         }
     }
 }
@@ -890,6 +988,115 @@ mod tests {
         assert_eq!(err.code(), "matrix_file_unknown_ticket");
     }
 
+    #[tokio::test]
+    async fn a_transfer_that_declares_no_size_is_accepted_and_counted() {
+        // Declaring a size is optional in the draft. Folding an absent one into the
+        // ceiling and then demanding an exact match would authorize every such transfer
+        // and refuse all but a 64 MiB one.
+        let plane = plane("nosize", 1024).await;
+        let authorized = plane
+            .authorize_upload(AuthorizeUploadParams {
+                mime_type: Some("image/gif".into()),
+                ..AuthorizeUploadParams::default()
+            })
+            .await
+            .expect("authorized without a size");
+
+        plane
+            .receive(
+                &id_of(&authorized),
+                &credential_of(&authorized),
+                body(vec![b"eleven byte"]),
+            )
+            .await
+            .expect("an undeclared transfer completes");
+
+        let staged = plane.take(&authorized.file.uri).await.expect("staged");
+        assert_eq!(staged.bytes, 11, "the count comes from the bytes");
+    }
+
+    #[tokio::test]
+    async fn an_undeclared_transfer_is_still_bounded_by_the_source_ceiling() {
+        let plane = plane("nosize-ceiling", 4).await;
+        let authorized = plane
+            .authorize_upload(AuthorizeUploadParams::default())
+            .await
+            .expect("authorized");
+
+        let err = plane
+            .receive(
+                &id_of(&authorized),
+                &credential_of(&authorized),
+                body(vec![b"far more than four"]),
+            )
+            .await
+            .expect_err("over the ceiling");
+        assert_eq!(err.code(), "matrix_file_size_mismatch");
+    }
+
+    #[tokio::test]
+    async fn a_transfer_in_flight_still_occupies_its_slot() {
+        // A claimed authorization used to vanish from both maps while its body streamed,
+        // so a caller could authorize, start a slow upload to free the slot, and repeat
+        // — accumulating partial files the ceiling was meant to bound.
+        let plane = FilePlane::new(FileConfig {
+            public_origin: "https://panel.example".into(),
+            staging_dir: scratch("inflight"),
+            ttl: Duration::from_secs(30),
+            max_staged: 1,
+            max_source_bytes: 1024,
+        })
+        .await
+        .expect("plane");
+
+        let authorized = plane.authorize_upload(params(5, None)).await.expect("ok");
+        let (id, credential) = (id_of(&authorized), credential_of(&authorized));
+
+        // A body that does not finish until this fires.
+        let (release, held) = tokio::sync::oneshot::channel::<()>();
+        let streaming = {
+            let plane = plane.clone();
+            tokio::spawn(async move {
+                let chunks = futures_util::stream::once(async move {
+                    let _ = held.await;
+                    Ok::<_, std::convert::Infallible>(bytes::Bytes::from_static(b"hello"))
+                });
+                plane.receive(&id, &credential, Box::pin(chunks)).await
+            })
+        };
+
+        // Give the transfer time to claim before asking for another slot.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let err = plane
+            .authorize_upload(params(5, None))
+            .await
+            .expect_err("the in-flight transfer still holds the only slot");
+        assert_eq!(err.code(), "matrix_file_too_many_staged");
+
+        release.send(()).expect("still receiving");
+        streaming
+            .await
+            .expect("joined")
+            .expect("transfer completes");
+    }
+
+    #[test]
+    fn every_way_of_failing_to_present_authority_looks_the_same_on_the_wire() {
+        // Telling these apart would confirm which identifiers are real.
+        let uniform = FileError::UnknownTicket.public_code();
+        assert_eq!(FileError::BadCredential.public_code(), uniform);
+        assert_eq!(FileError::Expired.public_code(), uniform);
+        assert_eq!(
+            FileError::UnknownTicket.http_status(),
+            FileError::BadCredential.http_status()
+        );
+        // Refusals that say nothing about identifiers keep their own code.
+        assert_eq!(
+            FileError::DigestMismatch.public_code(),
+            "matrix_file_digest_mismatch"
+        );
+    }
+
     #[test]
     fn only_a_bare_https_origin_is_accepted() {
         assert_eq!(
@@ -908,6 +1115,12 @@ mod tests {
             "https://panel.example?x=1",
             "panel.example",
             "https://",
+            // Shapes a prefix-and-character check waves through while naming no host.
+            // The first sign would be an intermediary refusing every descriptor.
+            "https://:",
+            "https://:8443",
+            "https://[::1",
+            "https:// panel.example",
         ] {
             assert!(
                 validate_public_origin(bad).is_err(),
