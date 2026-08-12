@@ -257,9 +257,13 @@ pub(crate) async fn decode_with_argv(
             .map_err(MediaError::Limit)?;
     }
 
+    // Measured once and reused: the value the ceiling clears has to be the same value
+    // both children are fed against. Measuring again would put a second, unchecked
+    // reading between the refusal and the feed, which is the gap this bound closes.
+    let source_bytes = source.byte_len().await?;
     params
         .limits
-        .check_source_bytes(source.byte_len().await?)
+        .check_source_bytes(source_bytes)
         .map_err(MediaError::Limit)?;
     if let Some(duration) = declared_duration {
         params
@@ -269,9 +273,6 @@ pub(crate) async fn decode_with_argv(
     }
 
     let deadline = tokio::time::Instant::now() + params.limits.decode_timeout;
-    // The one measurement both children are fed against, so neither can be handed more
-    // than the ceiling above just cleared.
-    let source_bytes = source.byte_len().await?;
     let probed = probe_with_argv(
         source,
         source_bytes,
