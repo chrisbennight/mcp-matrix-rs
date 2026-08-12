@@ -227,7 +227,15 @@ pub async fn submit_asset(
     // than parking the request indefinitely.
     let sequence = {
         let _slot = engine.acquire_decode_slot().await?;
-        matrix_media::decode(&source.bytes, None, None, &params, ffmpeg_bin, ffprobe_bin).await?
+        matrix_media::decode(
+            &matrix_media::Source::bytes(&source.bytes),
+            None,
+            None,
+            &params,
+            ffmpeg_bin,
+            ffprobe_bin,
+        )
+        .await?
     };
 
     let asset = engine

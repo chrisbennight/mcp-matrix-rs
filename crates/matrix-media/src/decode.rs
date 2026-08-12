@@ -9,10 +9,86 @@ use crate::ffmpeg;
 use crate::limits::{LimitError, Limits};
 use crate::{MediaError, NormalizeParams};
 use matrix_frame::FrameSequence;
+use std::path::Path;
 use std::process::Stdio;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::process::Command;
+use tokio::process::{ChildStdin, Command};
+
+/// The bytes a decode reads, in a form that can be handed to more than one subprocess.
+///
+/// A decode spawns two children in turn — the probe, then the decoder — and each needs
+/// its own complete read of the source. Taking a `&[u8]` forced every feeder to own a
+/// copy, because a spawned feeder task must be `'static`, so one decode held the
+/// caller's buffer plus one full copy per child. That is invisible at the inline cap and
+/// is not at `max_source_bytes`.
+///
+/// [`Source::File`] exists because bytes that arrive on a transfer path are already on
+/// disk: streaming them into the child costs a pipe buffer rather than the whole file.
+/// The path is always one this server minted. Caller input never selects it — decoding
+/// a destination a caller named is the confused-deputy pattern this crate refuses.
+#[derive(Debug, Clone)]
+pub enum Source {
+    /// Already resident. Shared between children rather than copied for each.
+    Bytes(Arc<[u8]>),
+    /// A server-minted path, streamed into each child.
+    File(Arc<Path>),
+}
+
+impl Source {
+    /// Take ownership of resident bytes. The one copy here replaces the per-child copies.
+    pub fn bytes(source: impl AsRef<[u8]>) -> Self {
+        Self::Bytes(Arc::from(source.as_ref()))
+    }
+
+    /// Read from a path this server minted.
+    pub fn file(path: impl AsRef<Path>) -> Self {
+        Self::File(Arc::from(path.as_ref()))
+    }
+
+    /// Length in bytes, so the source ceiling can still be applied before a fork.
+    ///
+    /// A staged file that cannot be stated is refused rather than attempted: the ceiling
+    /// is unenforceable without a length, and an unenforceable ceiling is the case it
+    /// exists for.
+    pub(crate) async fn byte_len(&self) -> Result<u64, MediaError> {
+        match self {
+            Self::Bytes(bytes) => Ok(bytes.len() as u64),
+            Self::File(path) => tokio::fs::metadata(path)
+                .await
+                .map(|meta| meta.len())
+                .map_err(|e| MediaError::Decoder(format!("could not measure the source: {e}"))),
+        }
+    }
+
+    /// Feed one child its own read of the source, concurrently with draining its output.
+    ///
+    /// Errors are dropped for the same reason the previous inline feeder dropped them: a
+    /// child that exits early — refusing the source, or having taken the frames its argv
+    /// bounded it to — closes the pipe mid-write, and that broken pipe is an ordinary
+    /// outcome rather than a decode failure. What the decode is judged on is the child's
+    /// exit status and the output actually collected.
+    fn spawn_feeder(&self, mut stdin: ChildStdin) -> tokio::task::JoinHandle<()> {
+        let source = self.clone();
+        tokio::spawn(async move {
+            match source {
+                Source::Bytes(bytes) => {
+                    let _ = stdin.write_all(&bytes).await;
+                }
+                Source::File(path) => match tokio::fs::File::open(&*path).await {
+                    Ok(mut file) => {
+                        let _ = tokio::io::copy(&mut file, &mut stdin).await;
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "could not open the staged source");
+                    }
+                },
+            }
+            let _ = stdin.shutdown().await;
+        })
+    }
+}
 
 /// Apply an address-space ceiling to a child before it execs.
 ///
@@ -83,7 +159,7 @@ pub const DEFAULT_FFMPEG_BIN: &str = "ffmpeg";
 /// count are what actually constrain the output, so a source that lies about its
 /// duration is still cut off.
 pub async fn decode(
-    source: &[u8],
+    source: &Source,
     declared_duration: Option<Duration>,
     declared_dimensions: Option<(u32, u32)>,
     params: &NormalizeParams,
@@ -111,7 +187,7 @@ pub async fn decode(
 /// separately leaves the order and the plumbing between them unasserted, which is how a
 /// check that was never called passed for one that was.
 pub(crate) async fn decode_with_argv(
-    source: &[u8],
+    source: &Source,
     declared_duration: Option<Duration>,
     declared_dimensions: Option<(u32, u32)>,
     params: &NormalizeParams,
@@ -127,7 +203,7 @@ pub(crate) async fn decode_with_argv(
 
     params
         .limits
-        .check_source_bytes(source.len() as u64)
+        .check_source_bytes(source.byte_len().await?)
         .map_err(MediaError::Limit)?;
     if let Some(duration) = declared_duration {
         params
@@ -159,7 +235,7 @@ pub(crate) async fn decode_with_argv(
 /// A failed probe or unreadable dimension is refused before decode because the source
 /// dimension cap cannot otherwise be enforced.
 pub async fn probe_and_check_dimensions(
-    source: &[u8],
+    source: &Source,
     limits: &Limits,
     ffprobe_bin: &str,
     deadline: tokio::time::Instant,
@@ -187,7 +263,7 @@ pub struct Probed {
 /// point supplies [`ffmpeg::probe_argv`]. A test that
 /// reimplemented the parse and the check would stay green if this were disconnected.
 pub(crate) async fn probe_with_argv(
-    source: &[u8],
+    source: &Source,
     limits: &Limits,
     bin: &str,
     argv: &[String],
@@ -206,13 +282,9 @@ pub(crate) async fn probe_with_argv(
         .spawn()
         .map_err(|e| MediaError::Decoder(format!("could not spawn {bin}: {e}")))?;
 
-    let mut stdin = child.stdin.take().expect("stdin was piped");
+    let stdin = child.stdin.take().expect("stdin was piped");
     let mut stdout = child.stdout.take().expect("stdout was piped");
-    let owned = source.to_vec();
-    let feeder = tokio::spawn(async move {
-        let _ = stdin.write_all(&owned).await;
-        let _ = stdin.shutdown().await;
-    });
+    let feeder = source.spawn_feeder(stdin);
 
     // The probe answers two questions — frame size and duration — in a few dozen
     // bytes, but its stdout is still shaped by the source: `-show_entries` prints per
@@ -302,7 +374,7 @@ pub(crate) async fn probe_with_argv(
 /// untrusted-media boundary. It takes its command line rather than deriving it so the
 /// spawn, feed, deadline, and reap behaviour can be exercised against a stand-in binary.
 pub(crate) async fn run_decoder_until(
-    source: &[u8],
+    source: &Source,
     params: &NormalizeParams,
     bin: &str,
     argv: &[String],
@@ -321,7 +393,7 @@ pub(crate) async fn run_decoder_until(
         .spawn()
         .map_err(|e| MediaError::Decoder(format!("could not spawn {bin}: {e}")))?;
 
-    let mut stdin = child
+    let stdin = child
         .stdin
         .take()
         .ok_or_else(|| MediaError::Decoder("decoder stdin was not piped".into()))?;
@@ -329,11 +401,7 @@ pub(crate) async fn run_decoder_until(
     // Feeding and reaping must be concurrent. A source larger than the pipe buffer
     // deadlocks if the parent writes it all before reading, because the child blocks
     // writing output nobody is draining.
-    let owned = source.to_vec();
-    let feeder = tokio::spawn(async move {
-        let _ = stdin.write_all(&owned).await;
-        let _ = stdin.shutdown().await;
-    });
+    let feeder = source.spawn_feeder(stdin);
 
     let mut stdout = child
         .stdout
@@ -493,7 +561,14 @@ mod tests {
     /// Drive the real probe path against a stand-in command.
     async fn probe(bin: &str, args: &[&str]) -> Result<Probed, MediaError> {
         let argv: Vec<String> = args.iter().map(|a| (*a).to_string()).collect();
-        probe_with_argv(b"source", &Limits::default(), bin, &argv, soon()).await
+        probe_with_argv(
+            &Source::bytes(b"source"),
+            &Limits::default(),
+            bin,
+            &argv,
+            soon(),
+        )
+        .await
     }
 
     #[tokio::test]
@@ -543,7 +618,7 @@ mod tests {
         let probe_out = format!("64x64\\n{over}\\n");
 
         let err = decode_with_argv(
-            b"x",
+            &Source::bytes(b"x"),
             None,
             None,
             &params,
@@ -565,7 +640,7 @@ mod tests {
         };
         let payload = vec![9u8; params.canvas.byte_len()];
         let sequence = decode_with_argv(
-            &payload,
+            &Source::bytes(&payload),
             None,
             None,
             &params,
@@ -603,7 +678,7 @@ mod tests {
         // decode wires the probe ahead of the decoder; a probe that cannot answer must
         // stop the ingest rather than let the decoder see the source.
         let err = decode(
-            b"x",
+            &Source::bytes(b"x"),
             None,
             None,
             &params(),
@@ -683,7 +758,7 @@ mod tests {
         };
         // Both binaries are absent: reaching either would surface a decoder error.
         let err = decode(
-            &[0u8; 64],
+            &Source::bytes([0u8; 64]),
             None,
             None,
             &params,
@@ -700,7 +775,7 @@ mod tests {
         // Both binaries are absent, so a decoder error here would mean the duration
         // bound ran too late.
         let err = decode(
-            b"x",
+            &Source::bytes(b"x"),
             Some(Duration::from_secs(3600)),
             None,
             &params(),
@@ -723,7 +798,7 @@ mod tests {
         };
         // Both binaries are absent: reaching either would surface a decoder error.
         let err = decode(
-            &[0u8; 64],
+            &Source::bytes([0u8; 64]),
             None,
             None,
             &params,
@@ -747,7 +822,7 @@ mod tests {
             },
             ..params()
         };
-        let err = run_decoder_until(b"x", &params, "cat", &[], soon())
+        let err = run_decoder_until(&Source::bytes(b"x"), &params, "cat", &[], soon())
             .await
             .expect_err("one frame is larger than the whole ceiling");
         assert_eq!(err.code(), "media_frame_exceeds_memory_ceiling");
@@ -755,9 +830,15 @@ mod tests {
 
     #[tokio::test]
     async fn a_missing_decoder_binary_is_a_decoder_error_not_a_panic() {
-        let err = run_decoder_until(b"x", &params(), "definitely-not-a-real-binary", &[], soon())
-            .await
-            .expect_err("cannot spawn");
+        let err = run_decoder_until(
+            &Source::bytes(b"x"),
+            &params(),
+            "definitely-not-a-real-binary",
+            &[],
+            soon(),
+        )
+        .await
+        .expect_err("cannot spawn");
         assert_eq!(err.code(), "media_decoder_failed");
     }
 
@@ -775,16 +856,22 @@ mod tests {
         // is derived from the configured timeout, as `decode` does — passing an
         // unrelated one would leave the setting untested and the test slow.
         let deadline = tokio::time::Instant::now() + params.limits.decode_timeout;
-        let err = run_decoder_until(b"x", &params, "sleep", &["30".into()], deadline)
-            .await
-            .expect_err("deadline must fire");
+        let err = run_decoder_until(
+            &Source::bytes(b"x"),
+            &params,
+            "sleep",
+            &["30".into()],
+            deadline,
+        )
+        .await
+        .expect_err("deadline must fire");
         assert_eq!(err.code(), "media_decode_timeout");
     }
 
     #[tokio::test]
     async fn a_decoder_exiting_nonzero_reports_failure_rather_than_empty_output() {
         // `false` exits 1 immediately, standing in for a decoder rejecting a source.
-        let err = run_decoder_until(b"x", &params(), "false", &[], soon())
+        let err = run_decoder_until(&Source::bytes(b"x"), &params(), "false", &[], soon())
             .await
             .expect_err("nonzero exit");
         assert_eq!(err.code(), "media_decoder_failed");
@@ -793,7 +880,7 @@ mod tests {
     #[tokio::test]
     async fn a_decoder_producing_nothing_is_reported_as_no_frames() {
         // `true` exits 0 having written no output.
-        let err = run_decoder_until(b"x", &params(), "true", &[], soon())
+        let err = run_decoder_until(&Source::bytes(b"x"), &params(), "true", &[], soon())
             .await
             .expect_err("no frames");
         assert_eq!(err.code(), "media_no_frames");
@@ -807,7 +894,7 @@ mod tests {
         };
         // `cat` echoes stdin, so a payload sized to two 2x2 frames round-trips as one.
         let payload = vec![7u8; params.canvas.byte_len() * 2];
-        let sequence = run_decoder_until(&payload, &params, "cat", &[], soon())
+        let sequence = run_decoder_until(&Source::bytes(&payload), &params, "cat", &[], soon())
             .await
             .expect("two whole frames");
 
@@ -822,6 +909,83 @@ mod tests {
         );
     }
 
+    /// A scratch file holding `bytes`, removed when the returned guard drops.
+    fn staged(name: &str, bytes: &[u8]) -> (std::path::PathBuf, impl Drop) {
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
+
+        let path = std::env::temp_dir().join(format!(
+            "matrix-source-{}-{}-{name}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or_default()
+        ));
+        std::fs::write(&path, bytes).expect("scratch file");
+        (path.clone(), Cleanup(path))
+    }
+
+    #[tokio::test]
+    async fn a_file_source_decodes_to_what_the_same_bytes_decode_to_in_memory() {
+        // The whole point of the file variant is that it changes how bytes reach the
+        // child, not what the child receives. Decoding the same payload both ways must
+        // therefore be indistinguishable in the output.
+        let params = NormalizeParams {
+            canvas: Canvas::new(2, 2).expect("valid"),
+            ..params()
+        };
+        let payload = vec![5u8; params.canvas.byte_len() * 3];
+        let (path, _cleanup) = staged("roundtrip", &payload);
+
+        let from_memory = run_decoder_until(&Source::bytes(&payload), &params, "cat", &[], soon())
+            .await
+            .expect("in-memory source decodes");
+        let from_file = run_decoder_until(&Source::file(&path), &params, "cat", &[], soon())
+            .await
+            .expect("file source decodes");
+
+        assert_eq!(from_file.len(), from_memory.len());
+        for index in 0..from_memory.len() {
+            assert_eq!(
+                from_file.get(index).expect("frame").as_rgb(),
+                from_memory.get(index).expect("frame").as_rgb(),
+                "frame {index} differs between the two source forms"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_oversized_file_source_is_refused_before_the_probe_runs() {
+        // The pre-spawn size ceiling has to survive the move to a file handle, or a
+        // staged source would reach the decoder unbounded. Both binaries are absent, so
+        // reaching either would surface a decoder error instead.
+        let params = NormalizeParams {
+            limits: Limits {
+                max_source_bytes: 8,
+                ..Limits::default()
+            },
+            ..params()
+        };
+        let (path, _cleanup) = staged("oversize", &[0u8; 64]);
+
+        let err = decode(
+            &Source::file(&path),
+            None,
+            None,
+            &params,
+            "definitely-not-a-real-binary",
+            "definitely-not-a-real-probe",
+        )
+        .await
+        .expect_err("refused before spawn");
+        assert_eq!(err.code(), "media_source_too_large");
+    }
+
     #[tokio::test]
     async fn a_payload_larger_than_a_pipe_buffer_does_not_deadlock() {
         // The feeder and the reaper run concurrently; writing everything before reading
@@ -833,7 +997,7 @@ mod tests {
         let payload = vec![3u8; params.canvas.byte_len() * 40]; // ~491 KB, well past 64 KB.
         let sequence = tokio::time::timeout(
             Duration::from_secs(20),
-            run_decoder_until(&payload, &params, "cat", &[], soon()),
+            run_decoder_until(&Source::bytes(&payload), &params, "cat", &[], soon()),
         )
         .await
         .expect("must not hang")
