@@ -19,10 +19,10 @@ use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::time::Duration;
 use thiserror::Error;
 use tokio::io::AsyncWriteExt;
-use tokio::sync::Mutex;
 use tokio::time::Instant;
 
 /// Scheme and authority this server mints for a staged source.
@@ -197,6 +197,25 @@ struct Ticket {
     expires_at: Instant,
 }
 
+/// Holds an in-flight slot for exactly as long as its transfer runs.
+///
+/// The release is in `Drop` rather than on the return path because a transfer can end
+/// without returning: an HTTP request future is dropped when its client disconnects, and
+/// the sweeper deliberately leaves in-flight entries alone so it cannot unlink a partial
+/// still being written. Anything that leaked here would leak until the process restarted.
+struct InFlight {
+    tickets: Arc<Mutex<HashMap<String, TicketState>>>,
+    id: String,
+}
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        if let Ok(mut tickets) = self.tickets.lock() {
+            tickets.remove(&self.id);
+        }
+    }
+}
+
 /// Whether an authorization is waiting for its transfer or already running one.
 ///
 /// Both occupy a slot. An in-flight transfer that vanished from this map would be
@@ -265,7 +284,7 @@ pub struct FileConfig {
 
 pub struct FilePlane {
     config: FileConfig,
-    tickets: Mutex<HashMap<String, TicketState>>,
+    tickets: Arc<Mutex<HashMap<String, TicketState>>>,
     staged: Mutex<HashMap<String, Staged>>,
     /// Sources taken by a tool call whose files still exist. Counted alongside the maps,
     /// so the ceiling bounds bytes on disk rather than bytes in a map.
@@ -345,7 +364,7 @@ impl FilePlane {
 
         Ok(Arc::new(Self {
             config,
-            tickets: Mutex::new(HashMap::new()),
+            tickets: Arc::new(Mutex::new(HashMap::new())),
             staged: Mutex::new(HashMap::new()),
             consuming: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }))
@@ -418,8 +437,8 @@ impl FilePlane {
         // the same pre-insert count and all pass, which is how a bound on outstanding
         // work turns into no bound at all. Lock order is tickets-then-staged everywhere.
         {
-            let mut tickets = self.tickets.lock().await;
-            let staged = self.staged.lock().await;
+            let mut tickets = self.tickets.lock().expect("transfer state lock");
+            let staged = self.staged.lock().expect("transfer state lock");
             let outstanding = tickets.len()
                 + staged.len()
                 + self.consuming.load(std::sync::atomic::Ordering::Acquire);
@@ -471,8 +490,8 @@ impl FilePlane {
     /// so a caller could authorize, begin a slow upload to free the slot, and repeat —
     /// accumulating partial files and connections that `max_staged` was supposed to
     /// bound.
-    async fn claim(&self, id: &str, credential: &str) -> Result<Ticket, FileError> {
-        let mut tickets = self.tickets.lock().await;
+    fn claim(&self, id: &str, credential: &str) -> Result<(Ticket, InFlight), FileError> {
+        let mut tickets = self.tickets.lock().expect("transfer state lock");
         let Some(TicketState::Idle(ticket)) = tickets.get(id) else {
             // A transfer already in flight is not claimable twice, and says the same
             // thing to a caller as one that never existed.
@@ -492,14 +511,15 @@ impl FilePlane {
         }
 
         match tickets.insert(id.to_string(), TicketState::InFlight) {
-            Some(TicketState::Idle(ticket)) => Ok(*ticket),
+            Some(TicketState::Idle(ticket)) => Ok((
+                *ticket,
+                InFlight {
+                    tickets: self.tickets.clone(),
+                    id: id.to_string(),
+                },
+            )),
             _ => unreachable!("the idle ticket was matched under this lock"),
         }
-    }
-
-    /// Release an in-flight slot once its transfer has finished, however it finished.
-    async fn release(&self, id: &str) {
-        self.tickets.lock().await.remove(id);
     }
 
     /// Receive one transfer's bytes and stage them if they are what was declared.
@@ -517,19 +537,19 @@ impl FilePlane {
         S: futures_util::Stream<Item = Result<bytes::Bytes, E>> + Unpin,
         E: std::fmt::Display,
     {
-        let ticket = self.claim(id, credential).await?;
+        // `_slot` releases the in-flight marker when it drops, which happens however this
+        // function ends — returning, timing out, or being cancelled because the client
+        // disconnected. Releasing it explicitly on the return path would skip the
+        // cancellation case entirely, and a cancelled upload would hold one of a very
+        // small number of slots until the process restarted.
+        let (ticket, _slot) = self.claim(id, credential)?;
 
-        // Bounded in time as well as in bytes. A transfer that stalls forever would
-        // otherwise hold its slot forever, and enough of those wedge the plane for
-        // everyone; the same window that expires an unused authorization applies here.
-        let outcome = tokio::time::timeout(self.config.ttl, self.stream_into(&ticket, chunks))
+        // Bounded in time as well as in bytes. A transfer that stalls without
+        // disconnecting is not cancelled by anything, so the same window that expires an
+        // unused authorization applies here.
+        tokio::time::timeout(self.config.ttl, self.stream_into(&ticket, chunks))
             .await
-            .unwrap_or(Err(FileError::Expired));
-
-        // However it ended, the slot is returned. On success `stream_into` has already
-        // recorded the staged source, which is what the slot becomes.
-        self.release(id).await;
-        outcome
+            .unwrap_or(Err(FileError::Expired))
     }
 
     async fn stream_into<S, E>(&self, ticket: &Ticket, mut chunks: S) -> Result<(), FileError>
@@ -593,7 +613,7 @@ impl FilePlane {
             .await
             .map_err(|e| FileError::Staging(format!("publishing the staged file: {e}")))?;
 
-        self.staged.lock().await.insert(
+        self.staged.lock().expect("transfer state lock").insert(
             ticket.staged_id.clone(),
             Staged {
                 path: ticket.final_path.clone(),
@@ -620,7 +640,7 @@ impl FilePlane {
             // the map entry or the raised counter and never a gap between them. Releasing
             // first would let a concurrent authorization observe neither and admit work
             // past the ceiling.
-            let mut entries = self.staged.lock().await;
+            let mut entries = self.staged.lock().expect("transfer state lock");
             let staged = entries.remove(id)?;
             self.consuming
                 .fetch_add(1, std::sync::atomic::Ordering::Release);
@@ -640,23 +660,26 @@ impl FilePlane {
     pub async fn sweep(&self) {
         let now = Instant::now();
         let ttl = self.config.ttl;
-        self.tickets.lock().await.retain(|_, state| match state {
-            // An in-flight transfer is bounded by its own receive deadline, not by this
-            // sweep: collecting it here would unlink a partial file still being written.
-            TicketState::InFlight => true,
-            TicketState::Idle(ticket) => now <= ticket.expires_at,
-        });
+        self.tickets
+            .lock()
+            .expect("transfer state lock")
+            .retain(|_, state| match state {
+                // An in-flight transfer is bounded by its own receive deadline, not by this
+                // sweep: collecting it here would unlink a partial file still being written.
+                TicketState::InFlight => true,
+                TicketState::Idle(ticket) => now <= ticket.expires_at,
+            });
         self.staged
             .lock()
-            .await
+            .expect("transfer state lock")
             .retain(|_, s| now.saturating_duration_since(s.staged_at) <= ttl);
     }
 
     #[cfg(test)]
     pub async fn buckets(&self) -> (usize, usize, usize) {
         (
-            self.tickets.lock().await.len(),
-            self.staged.lock().await.len(),
+            self.tickets.lock().expect("transfer state lock").len(),
+            self.staged.lock().expect("transfer state lock").len(),
             self.consuming.load(std::sync::atomic::Ordering::Acquire),
         )
     }
@@ -1258,6 +1281,54 @@ mod tests {
             "the upload identifier must not redeem the staged source"
         );
         assert!(plane.take(&authorized.file.uri).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_transfer_gives_its_slot_back() {
+        // An HTTP request future is dropped when its client disconnects, so a transfer
+        // can end without ever returning. Releasing the slot only on the return path
+        // leaked one per cancellation, and the sweeper deliberately leaves in-flight
+        // entries alone — so a handful of dropped connections disabled the plane until
+        // the process restarted.
+        let plane = FilePlane::new(FileConfig {
+            public_origin: "https://panel.example".into(),
+            staging_dir: scratch("cancelled"),
+            ttl: Duration::from_secs(30),
+            max_staged: 1,
+            max_source_bytes: 1024,
+        })
+        .await
+        .expect("plane");
+
+        let authorized = plane.authorize_upload(params(5, None)).await.expect("ok");
+
+        // A body that never yields, abandoned partway. `timeout` drops the receive
+        // future when it elapses, which is what a disconnect does.
+        let stalled =
+            futures_util::stream::pending::<Result<bytes::Bytes, std::convert::Infallible>>();
+        let cancelled = tokio::time::timeout(
+            Duration::from_millis(50),
+            plane.receive(
+                &id_of(&authorized),
+                &credential_of(&authorized),
+                Box::pin(stalled),
+            ),
+        )
+        .await;
+        assert!(
+            cancelled.is_err(),
+            "the transfer was abandoned, not completed"
+        );
+
+        assert_eq!(
+            plane.buckets().await,
+            (0, 0, 0),
+            "an abandoned transfer must not keep its slot"
+        );
+        plane
+            .authorize_upload(params(5, None))
+            .await
+            .expect("the slot is available again");
     }
 
     #[tokio::test]
