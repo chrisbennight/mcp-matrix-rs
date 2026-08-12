@@ -272,8 +272,18 @@ impl Staged {
 }
 
 impl Drop for Staged {
+    /// The slot is released even if the unlink failed, and the failure is logged.
+    ///
+    /// Holding the slot back instead would turn a transient filesystem error into a
+    /// permanent loss of capacity: nothing ever retries a `Drop`, so the slot would stay
+    /// occupied by a file that may well be gone, and enough of those would wedge the
+    /// plane until a restart. Releasing keeps the plane working and bounds the damage to
+    /// disk the operator can see — which is why the failure is worth a log line rather
+    /// than silence, since it is the only signal that staging is not reclaiming space.
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
+        if let Err(e) = std::fs::remove_file(&self.path) {
+            tracing::warn!(error = %e, "could not remove a staged file");
+        }
         if let Some(consuming) = &self.consuming {
             consuming.fetch_sub(1, std::sync::atomic::Ordering::Release);
         }
