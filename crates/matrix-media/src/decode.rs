@@ -113,14 +113,25 @@ async fn feed_bounded(
 ) -> Result<(), MediaError> {
     let mut reader = file.take(bound);
     let mut buf = vec![0u8; 64 * 1024];
+    let mut delivered = 0u64;
     loop {
         let read = reader
             .read(&mut buf)
             .await
             .map_err(|e| MediaError::Decoder(format!("could not read the source: {e}")))?;
         if read == 0 {
-            return Ok(());
+            // Ending early is the same defect as growing, from the other side: the child
+            // was handed a prefix of what was measured, and a prefix it decodes cleanly
+            // becomes a truncated sequence published as a whole one.
+            return if delivered == bound {
+                Ok(())
+            } else {
+                Err(MediaError::Decoder(format!(
+                    "source ended after {delivered} of {bound} measured bytes"
+                )))
+            };
         }
+        delivered += read as u64;
         // The child stopping its read is ordinary; only the read side above is a failure.
         if stdin.write_all(&buf[..read]).await.is_err() {
             return Ok(());
@@ -1108,6 +1119,37 @@ mod tests {
         assert!(
             err.to_string().contains("could not read the source"),
             "the refusal names the read failure rather than the empty output: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_file_source_shorter_than_its_measurement_fails_rather_than_decoding_a_prefix() {
+        // The other side of the bound: a source that ended early hands the decoder a
+        // prefix, and `cat` would echo it cleanly into a shorter but perfectly valid
+        // sequence. Passing a bound above the file's real size is what a file truncated
+        // after byte_len() looks like to the feeder.
+        let params = NormalizeParams {
+            canvas: Canvas::new(2, 2).expect("valid"),
+            ..params()
+        };
+        let frame = params.canvas.byte_len();
+        let staged = Staged::new("shrunk", &vec![6u8; frame]);
+
+        let err = run_decoder_until(
+            &Source::file(staged.path()),
+            (frame * 3) as u64,
+            &params,
+            "cat",
+            &[],
+            soon(),
+        )
+        .await
+        .expect_err("a short source must not decode as a whole one");
+
+        assert_eq!(err.code(), "media_decoder_failed");
+        assert!(
+            err.to_string().contains("measured bytes"),
+            "the refusal names the short read rather than the frame count: {err}"
         );
     }
 
