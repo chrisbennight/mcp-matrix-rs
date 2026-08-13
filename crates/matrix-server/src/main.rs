@@ -64,13 +64,17 @@ struct Args {
     )]
     allowed_hosts: Vec<String>,
 
-    /// Public HTTPS origin this server is reached at, which enables the transfer plane.
+    /// Public origin this server is reached at, which enables the transfer plane.
     ///
     /// Scheme and authority only, e.g. `https://panel.example.org`. Unset leaves the
     /// server inline-only. A trusted intermediary dials this to deliver media too large
     /// for a tool argument, and reuses the addresses it pinned for `/mcp` only when this
-    /// names that same host — so it should be the origin `/mcp` is already served on,
-    /// behind the operator's existing TLS boundary.
+    /// names that same host — so it should be the origin `/mcp` is already served on.
+    ///
+    /// `http` is accepted for a deployment whose intermediary reaches this server over a
+    /// private segment it already trusts in cleartext. Whether that holds is a property
+    /// of the topology this process cannot see, so it is the operator's assertion to
+    /// make; an intermediary refuses a plaintext descriptor from anywhere else.
     #[arg(long, env = "MATRIX_FILE_PUBLIC_URL")]
     file_public_url: Option<String>,
 

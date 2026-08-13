@@ -97,9 +97,9 @@ trusted intermediary obtains a single-use upload authorization, streams the medi
 server directly, and a later `matrix_submit_asset` names the result. The bytes never
 appear in a tool argument or in model context.
 
-That plane is off unless `MATRIX_FILE_PUBLIC_URL` names the public HTTPS origin this
-server is reached at; unset, the server is inline-only exactly as before. It requires the
-HTTP transport, and the origin should be the one `/mcp` is already served on. See
+That plane is off unless `MATRIX_FILE_PUBLIC_URL` names the public origin this server is
+reached at; unset, the server is inline-only exactly as before. It requires the HTTP
+transport, and the origin should be the one `/mcp` is already served on. See
 [configuration](docs/configuration.md#the-transfer-plane) and
 [deployment](docs/deployment.md#file-staging).
 

@@ -324,8 +324,20 @@ pub fn validate_public_origin(origin: &str) -> Result<String, String> {
     // and the first sign of that would be an intermediary refusing every descriptor.
     let parsed = url::Url::parse(origin).map_err(|e| format!("is not a URL: {e}"))?;
 
-    if parsed.scheme() != "https" {
-        return Err(format!("must use https, got {:?}", parsed.scheme()));
+    // `http` is accepted as well as `https`, and this server does not try to decide
+    // whether that is wise. A plaintext origin is only sound where the intermediary
+    // reaches this server the same way — over a private segment it already trusts in
+    // cleartext — and that is a fact about the deployment's topology, which this process
+    // cannot see. It knows only the string it was handed. Enforcement belongs where the
+    // knowledge is: the intermediary knows how it dialled and refuses a plaintext
+    // descriptor from anywhere else. Refusing `http` here would not add a check, it would
+    // only make the arrangement impossible to configure.
+    if !matches!(parsed.scheme(), "https" | "http") {
+        return Err(format!(
+            "must use https, or http on a network the intermediary already trusts in \
+             cleartext, got {:?}",
+            parsed.scheme()
+        ));
     }
     if parsed.host_str().is_none_or(str::is_empty) {
         return Err("must name a host".into());
@@ -341,9 +353,10 @@ pub fn validate_public_origin(origin: &str) -> Result<String, String> {
     // Rebuilt from the parse so the stored value is exactly what descriptors are built
     // from, with any default port and trailing slash normalised away.
     let host = parsed.host_str().expect("checked above");
+    let scheme = parsed.scheme();
     Ok(match parsed.port() {
-        Some(port) => format!("https://{host}:{port}"),
-        None => format!("https://{host}"),
+        Some(port) => format!("{scheme}://{host}:{port}"),
+        None => format!("{scheme}://{host}"),
     })
 }
 
@@ -1509,10 +1522,17 @@ mod tests {
     }
 
     #[test]
-    fn only_a_bare_https_origin_is_accepted() {
+    fn only_a_bare_origin_is_accepted_over_either_scheme() {
         assert_eq!(
             validate_public_origin("https://panel.example/").expect("trailing slash trimmed"),
             "https://panel.example"
+        );
+        // Plaintext is accepted and kept: a descriptor built from it has to name the
+        // scheme the intermediary will actually dial, and an intermediary that admits
+        // plaintext at all requires the declared transport and the URL to agree.
+        assert_eq!(
+            validate_public_origin("http://matrix-mcp:8080").expect("plaintext origin"),
+            "http://matrix-mcp:8080"
         );
         assert_eq!(
             validate_public_origin("https://panel.example:8443")
@@ -1520,7 +1540,7 @@ mod tests {
             "https://panel.example:8443"
         );
         for bad in [
-            "http://panel.example",
+            "ftp://panel.example",
             "https://user:pw@panel.example",
             "https://panel.example/files",
             "https://panel.example?x=1",
