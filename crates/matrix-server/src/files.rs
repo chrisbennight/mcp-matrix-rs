@@ -312,12 +312,14 @@ pub struct FilePlane {
     consuming: Arc<std::sync::atomic::AtomicUsize>,
 }
 
-/// Reject anything that is not a bare `https` origin.
+/// Reject anything that is not a bare origin.
 ///
 /// The descriptor URL is what a trusted intermediary will dial and what its own policy
-/// checks; a path, query, or userinfo here would either be dropped or refused there, and
-/// a plaintext origin is refused outright. Failing at startup beats minting descriptors
-/// that every transfer rejects.
+/// checks; a path, query, or userinfo here would either be dropped or refused there.
+/// Failing at startup beats minting descriptors that every transfer rejects.
+///
+/// Both `https` and `http` are accepted — see the scheme check below for why this server
+/// does not judge which is appropriate.
 pub fn validate_public_origin(origin: &str) -> Result<String, String> {
     // Parsed rather than pattern-matched. Prefix and character checks admit strings that
     // look like origins without naming one — `https://:` and `https://[::1` among them —
@@ -402,6 +404,18 @@ impl FilePlane {
             staged: Mutex::new(HashMap::new()),
             consuming: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }))
+    }
+
+    /// The transport a descriptor declares, taken from the configured origin.
+    ///
+    /// Both are `&'static str` because both are literals; the origin is validated at
+    /// startup, so anything that is not `https` is `http` by elimination.
+    fn descriptor_transport(&self) -> &'static str {
+        if self.config.public_origin.starts_with("https://") {
+            "https"
+        } else {
+            "http"
+        }
     }
 
     /// Mint a single-use authorization for one transfer.
@@ -501,7 +515,11 @@ impl FilePlane {
                 digest: params.digest,
             },
             upload: TransferDescriptor {
-                transport: "https",
+                // The scheme the URL actually uses. A descriptor that declares one
+                // protection level and names another is refused by an intermediary that
+                // admits plaintext at all — it requires the two to agree, precisely so a
+                // transfer cannot run in the clear under a descriptor claiming TLS.
+                transport: self.descriptor_transport(),
                 method: "PUT",
                 url,
                 // The only authority on the ingest route. It travels in a header rather
@@ -988,12 +1006,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_plaintext_origin_yields_a_descriptor_that_agrees_with_itself() {
+        // The transport was a constant while the URL followed the origin, so an http
+        // deployment emitted `transport: "https"` against an `http://` URL. An
+        // intermediary that admits plaintext at all requires the two to agree —
+        // otherwise a transfer could run in the clear under a descriptor claiming TLS —
+        // so that descriptor is refused and the plaintext sidecar this release exists
+        // to enable would never have worked.
+        let plane = FilePlane::new(FileConfig {
+            public_origin: "http://matrix-mcp:8080".into(),
+            staging_dir: scratch("plaintext-descriptor"),
+            ttl: Duration::from_secs(300),
+            max_staged: 4,
+            max_source_bytes: 1024,
+        })
+        .await
+        .expect("plane");
+
+        let authorized = plane.authorize_upload(params(4, None)).await.expect("ok");
+        assert_eq!(authorized.upload.transport, "http");
+        assert!(
+            authorized
+                .upload
+                .url
+                .starts_with("http://matrix-mcp:8080/files/upload/"),
+            "{}",
+            authorized.upload.url
+        );
+
+        // The declared transport is the URL's scheme, whichever it is.
+        let scheme = authorized
+            .upload
+            .url
+            .split_once("://")
+            .expect("an absolute URL")
+            .0;
+        assert_eq!(authorized.upload.transport, scheme);
+    }
+
+    #[tokio::test]
     async fn the_descriptor_points_at_the_configured_origin_and_carries_its_own_authority() {
         let plane = plane("descriptor", 1024).await;
         let authorized = plane.authorize_upload(params(4, None)).await.expect("ok");
 
         assert_eq!(authorized.upload.transport, "https");
         assert_eq!(authorized.upload.method, "PUT");
+        assert!(
+            authorized.upload.url.starts_with("https://"),
+            "the declared transport is the URL's scheme: {}",
+            authorized.upload.url
+        );
         assert!(
             authorized
                 .upload
