@@ -158,9 +158,12 @@ async fn main() -> Result<()> {
         ffprobe: args.ffprobe_bin.clone(),
     };
 
-    // The plane needs a listener to receive on and a TLS boundary in front of it, and
-    // stdio has neither. Refusing the combination beats starting a server that mints
-    // descriptors nothing can reach.
+    // The plane needs a listener to receive transfers on, and stdio has none — it
+    // speaks MCP over pipes to one spawning process and serves no HTTP at all.
+    // Refusing the combination beats starting a server that mints descriptors nothing
+    // can reach. (What fronts that listener is the operator's choice: a TLS boundary
+    // for a public origin, or nothing at all for a private segment an intermediary
+    // already reaches in cleartext.)
     if args.stdio && args.file_public_url.is_some() {
         anyhow::bail!(
             "--file-public-url needs the HTTP transport: under --stdio there is no \

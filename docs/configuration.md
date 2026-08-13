@@ -51,7 +51,7 @@ method-not-found is the contract — a file-aware intermediary reads it as "this
 has no native file transfer" and stops asking.
 
 Setting it turns on the receiving side of the draft file-transfer contract, which is how
-media past the inline cap reaches the panel. Three constraints come with it:
+media past the inline cap reaches the panel. Four constraints come with it:
 
 - **It must be a bare origin, scheme and authority only.** A path, query, or userinfo is
   refused at startup. `https` is the normal choice, and this server does not terminate
