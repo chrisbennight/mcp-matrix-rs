@@ -33,6 +33,16 @@ All notable changes to this project are documented in this file. The format foll
 
 ### Changed
 
+- `matrix_submit_asset` accepts `source` as a bare URI string as well as the
+  object it has always taken, and publishes both shapes in its schema. SEP-2631
+  declares a file-valued tool input as a URI *string* — its file object is the
+  shape of outputs and authorization results — so an object-only contract worked
+  behind an intermediary that translates it and not for a client speaking the
+  draft directly. Both shapes resolve identically, including for a reference the
+  transfer plane staged. This widens what is accepted and removes nothing, so
+  every existing caller is unaffected; and writing a reference differently does
+  not change what a reference may name, so a caller-named URL in either shape is
+  still refused with `matrix_unsupported_source`.
 - `matrix-media`'s decode entry points take a source handle rather than a byte
   slice, so feeding the probe and the decoder no longer copies the source once per
   subprocess, and a staged transfer streams from disk instead of being held in

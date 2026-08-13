@@ -211,9 +211,10 @@ A typical session from the client:
    headroom before displaying content.
 2. `matrix_show_text` with `{"text": "HELLO"}` — text that fits shows as a centered
    still; longer text scrolls as a marquee until stopped.
-3. `matrix_submit_asset` with a base64 `data:` URI (16 KiB limit) or with a reference an
-   intermediary staged through the transfer plane, then `matrix_play` with the returned
-   asset handle. Both forms use the same argument and return the same report.
+3. `matrix_submit_asset` with a base64 `data:` URI (16 KiB limit) or with a reference
+   staged through the transfer plane, then `matrix_play` with the returned asset handle.
+   Either can be written as a bare URI string or as an object carrying that URI, and all
+   four combinations return the same report.
 4. `matrix_stop` — the panel returns to its configured ambient behaviour.
 
 ### Tools

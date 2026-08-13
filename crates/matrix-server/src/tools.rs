@@ -57,25 +57,128 @@ impl ToolError {
     }
 }
 
-/// A reference to media, shaped so an intermediary-minted reference and an inline
-/// payload use one contract.
+/// A reference to media, in either shape a caller may write it.
 ///
-/// The shape matches SEP-2631's file object, so adopting that draft later changes how a
-/// `uri` is produced and not what this tool accepts. Unlike the tool parameter structs,
-/// unknown keys are tolerated here: the shape is an external draft's, and a future
-/// revision may add fields an intermediary forwards before this server learns them.
-#[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
+/// SEP-2631 declares a file-valued tool input as a URI **string**; its file object is the
+/// shape of outputs and authorization results, not of inputs. This server accepted only
+/// the object, which a file-aware intermediary translates as a documented compatibility
+/// extension — so the transfer plane worked behind one and not for a client speaking the
+/// draft directly.
+///
+/// Both are accepted now and resolve identically. The object stays because it is what an
+/// intermediary sends today and what every existing caller writes; the string is the
+/// interoperable form. Neither widens what a reference may name — a `data:` URI or one
+/// this server minted, and nothing else.
+#[derive(Debug, Clone)]
 pub struct FileValue {
     /// A `data:` URI for content already at native resolution, or a URI a trusted
     /// intermediary resolved. A destination named by the caller is never dereferenced
     /// here.
     pub uri: String,
-    #[serde(default)]
     pub name: Option<String>,
-    #[serde(default, rename = "mimeType")]
     pub mime_type: Option<String>,
-    #[serde(default)]
     pub size: Option<u64>,
+}
+
+// Deliberately a separate type: it derives the object shape and the object schema, which
+// the hand-written `FileValue` composes into the published union. Its doc comment is
+// caller-facing because schemars publishes it as the branch's description — an internal
+// note here would end up on the wire.
+/// The reference with optional metadata alongside it. Unknown keys are tolerated, so an
+/// intermediary may forward fields this server does not yet read.
+#[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
+struct FileObject {
+    /// The reference itself, the same value the string form carries on its own.
+    uri: String,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default, rename = "mimeType")]
+    mime_type: Option<String>,
+    #[serde(default)]
+    size: Option<u64>,
+}
+
+impl<'de> Deserialize<'de> for FileValue {
+    /// Written out rather than derived through `#[serde(untagged)]`.
+    ///
+    /// An untagged enum reports every failure as "data did not match any variant",
+    /// which would turn a typo'd `mimeType` or a numeric `uri` into one unactionable
+    /// message. This server refuses precisely elsewhere for the same reason — see the
+    /// hand-written deserializer on `BehaviorParam` — and a caller cannot fix a
+    /// submission it cannot diagnose.
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct Either;
+
+        impl<'de> serde::de::Visitor<'de> for Either {
+            type Value = FileValue;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a URI string, or an object carrying a `uri`")
+            }
+
+            fn visit_str<E: serde::de::Error>(self, uri: &str) -> Result<FileValue, E> {
+                Ok(FileValue {
+                    uri: uri.to_string(),
+                    name: None,
+                    mime_type: None,
+                    size: None,
+                })
+            }
+
+            fn visit_map<A>(self, map: A) -> Result<FileValue, A::Error>
+            where
+                A: serde::de::MapAccess<'de>,
+            {
+                // Delegating keeps the object form's field errors exactly as they are.
+                let object =
+                    FileObject::deserialize(serde::de::value::MapAccessDeserializer::new(map))?;
+                Ok(FileValue {
+                    uri: object.uri,
+                    name: object.name,
+                    mime_type: object.mime_type,
+                    size: object.size,
+                })
+            }
+        }
+
+        deserializer.deserialize_any(Either)
+    }
+}
+
+impl schemars::JsonSchema for FileValue {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "FileValue".into()
+    }
+
+    /// Both shapes, published whether or not the transfer plane is configured.
+    ///
+    /// The annotation that marks this a file input is attached when the tool list is
+    /// served, because it follows the deployment. The *shape* does not: a bare `data:`
+    /// string is a perfectly ordinary submission on an inline-only server, so a caller
+    /// must be able to see that it is accepted there too.
+    fn json_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        let object = serde_json::Value::from(FileObject::json_schema(generator));
+        schemars::Schema::try_from(serde_json::json!({
+            "description": "Media to normalize, as a URI string or as an object carrying \
+                            that URI. A `data:` URI carries its own bytes; a reference \
+                            this server minted for a completed transfer names bytes it \
+                            already holds. Any other destination is refused rather than \
+                            fetched.",
+            "anyOf": [
+                {
+                    "type": "string",
+                    "format": "uri",
+                    "description": "The reference on its own, which is the form \
+                                    SEP-2631 declares for a file-valued input."
+                },
+                object
+            ]
+        }))
+        .expect("a composed object schema is a valid schema")
+    }
 }
 
 /// A reference turned into something the decoder can read.
@@ -787,6 +890,120 @@ mod tests {
 
     fn b64(bytes: &[u8]) -> String {
         base64::engine::general_purpose::STANDARD.encode(bytes)
+    }
+
+    #[test]
+    fn a_bare_uri_string_and_the_object_carrying_it_are_the_same_reference() {
+        // The draft declares a file-valued input as a URI string; the object is what an
+        // intermediary sends. Both have to mean exactly one thing here, or the two kinds
+        // of caller would get different behaviour from the same submission.
+        let uri = format!("data:image/png;base64,{}", b64(b"hello"));
+
+        let from_string: FileValue =
+            serde_json::from_value(serde_json::Value::String(uri.clone())).expect("string form");
+        let from_object: FileValue =
+            serde_json::from_value(serde_json::json!({ "uri": uri })).expect("object form");
+
+        assert_eq!(from_string.uri, from_object.uri);
+        let resolved = |value: &FileValue| {
+            let source = resolve_inline(value).expect("resolves");
+            (
+                source.inline_bytes().to_vec(),
+                source.media_type().to_string(),
+            )
+        };
+        assert_eq!(resolved(&from_string), resolved(&from_object));
+    }
+
+    #[test]
+    fn the_string_form_carries_no_metadata_and_needs_none() {
+        let value: FileValue =
+            serde_json::from_value(serde_json::json!("matrix-file://staged/abc")).expect("string");
+        assert_eq!(value.uri, "matrix-file://staged/abc");
+        assert!(value.name.is_none() && value.mime_type.is_none() && value.size.is_none());
+    }
+
+    #[test]
+    fn a_caller_named_url_is_refused_in_either_shape() {
+        // The string form must not become a way around the boundary: it changes how a
+        // reference is written, never what a reference may name.
+        for value in [
+            serde_json::json!("https://example.invalid/clip.gif"),
+            serde_json::json!({ "uri": "https://example.invalid/clip.gif" }),
+            serde_json::json!("file:///etc/passwd"),
+            serde_json::json!({ "uri": "file:///etc/passwd" }),
+        ] {
+            let parsed: FileValue = serde_json::from_value(value.clone()).expect("parses");
+            assert_eq!(
+                resolve_inline(&parsed).expect_err("must not fetch").code(),
+                "matrix_unsupported_source",
+                "{value} must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn a_source_that_is_neither_shape_is_refused_by_what_it_is() {
+        // An untagged enum would answer every one of these with "data did not match any
+        // variant". A caller cannot fix a submission it cannot diagnose.
+        let expecting = |value: serde_json::Value| {
+            serde_json::from_value::<FileValue>(value)
+                .expect_err("not a reference")
+                .to_string()
+        };
+
+        assert!(
+            expecting(serde_json::json!(7)).contains("URI string"),
+            "a number is told what was expected: {}",
+            expecting(serde_json::json!(7))
+        );
+        // A malformed object still gets the object form's own field error.
+        let missing = expecting(serde_json::json!({ "name": "clip.gif" }));
+        assert!(
+            missing.contains("uri"),
+            "the missing field is named: {missing}"
+        );
+        // Whatever the exact wording, none of these may collapse into the
+        // "did not match any variant" an untagged enum would produce — that says
+        // nothing a caller can act on.
+        for value in [
+            serde_json::json!(7),
+            serde_json::json!({ "uri": 7 }),
+            serde_json::json!({ "name": "clip.gif" }),
+            serde_json::json!([]),
+        ] {
+            let message = expecting(value.clone());
+            assert!(
+                !message.contains("any variant"),
+                "{value} must be refused for what it is, got: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_published_source_schema_offers_both_shapes() {
+        // Published whether or not the transfer plane is configured: a bare `data:`
+        // string is an ordinary submission on an inline-only server too.
+        let schema = serde_json::to_value(schemars::schema_for!(crate::mcp::SubmitParams))
+            .expect("schema serializes");
+        let branches = schema["$defs"]["FileValue"]["anyOf"]
+            .as_array()
+            .expect("source is a union of both shapes");
+
+        assert_eq!(branches.len(), 2);
+        assert!(
+            branches.iter().any(|b| b["type"] == "string"),
+            "the interoperable string form is published: {branches:?}"
+        );
+        let object = branches
+            .iter()
+            .find(|b| b["type"] == "object")
+            .expect("the object form is still published");
+        assert_eq!(object["required"], serde_json::json!(["uri"]));
+        assert!(
+            object["properties"]["mimeType"].is_object(),
+            "the object form keeps its declared metadata: {object}"
+        );
     }
 
     #[test]
