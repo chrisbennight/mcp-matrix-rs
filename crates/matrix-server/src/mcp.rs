@@ -388,7 +388,12 @@ fn annotate_file_input(tool: &mut rmcp::model::Tool) {
 
 #[tool_handler(
     name = "matrix-server",
-    version = "0.2.0",
+    // The macro takes a literal, so this cannot read the crate metadata directly. It
+    // said 0.2.0 through the whole of 0.3.0 for exactly the reason a version in two
+    // places always drifts — only one of them got updated. `the_advertised_version_is_
+    // the_crate_version` fails the build when they disagree, which is the part that
+    // stops it happening again.
+    version = "0.4.0",
     instructions = "Renders media to a WLED LED matrix. Submit media to get an asset \
                     handle, then play that handle. Playback is paced by the framerate \
                     the panel reports and each frame is clamped to the panel's power \
@@ -479,5 +484,43 @@ impl ServerHandler for MatrixHandler {
         // Private: the catalog belongs to one server instance. A shared intermediary
         // must not serve one instance's tools as another's.
         .with_cache_scope(CacheScope::Private))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The version a client is told must be the version that was built.
+    ///
+    /// `#[tool_handler]` takes a literal, so the crate version cannot be interpolated
+    /// into it and the two are maintained separately. They drifted once already — the
+    /// handler advertised 0.2.0 for the whole of 0.3.0 — and a caller has no way to
+    /// notice, because the wrong answer is a perfectly well-formed one. Failing here
+    /// makes a release that forgets this impossible to ship.
+    #[test]
+    fn the_advertised_version_is_the_crate_version() {
+        let engine = crate::state::Engine::new(
+            matrix_frame::Canvas::new(64, 64).expect("valid"),
+            matrix_frame::Rate::new(25).expect("valid"),
+            matrix_device::WledClient::new(
+                "http://127.0.0.1:1".to_string(),
+                std::time::Duration::from_millis(1),
+            )
+            .expect("valid base"),
+            "127.0.0.1:4048".parse().expect("addr"),
+        );
+        let handler = MatrixHandler::new(
+            engine,
+            MediaBinaries {
+                ffmpeg: "ffmpeg".into(),
+                ffprobe: "ffprobe".into(),
+            },
+        );
+
+        assert_eq!(
+            handler.get_info().server_info.version,
+            env!("CARGO_PKG_VERSION"),
+        );
     }
 }
