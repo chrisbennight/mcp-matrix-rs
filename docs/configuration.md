@@ -16,7 +16,7 @@ variable listed below. Run `matrix-server --help` for the corresponding option n
 | `MATRIX_FFMPEG_BIN` | no | `ffmpeg` | FFmpeg executable path |
 | `MATRIX_FFPROBE_BIN` | no | `ffprobe` | ffprobe executable path |
 | `MATRIX_STDIO` | no | off | Serve MCP over stdio to the spawning client instead of listening on HTTP |
-| `MATRIX_FILE_PUBLIC_URL` | no | unset | Public HTTPS origin this server is reached at. Setting it enables the transfer plane; unset leaves the server inline-only |
+| `MATRIX_FILE_PUBLIC_URL` | no | unset | Public origin this server is reached at. Setting it enables the transfer plane; unset leaves the server inline-only |
 | `MATRIX_FILE_STAGING_DIR` | no | `/tmp/matrix-staging` | Directory transfers are staged in. Created if absent and restricted to the server's own user |
 | `MATRIX_FILE_TTL_SECS` | no | `300` | How long an unused authorization or an unconsumed staged transfer survives |
 | `MATRIX_FILE_MAX_STAGED` | no | `4` | Ceiling on authorizations and staged transfers outstanding at once |
@@ -51,12 +51,16 @@ method-not-found is the contract — a file-aware intermediary reads it as "this
 has no native file transfer" and stops asking.
 
 Setting it turns on the receiving side of the draft file-transfer contract, which is how
-media past the inline cap reaches the panel. Three constraints come with it:
+media past the inline cap reaches the panel. Four constraints come with it:
 
-- **It must be an `https` origin, scheme and authority only.** A path, query, userinfo,
-  or plain `http` is refused at startup. The value is what a trusted intermediary dials,
-  and it will refuse a descriptor that is not HTTPS with a certificate valid against the
-  system roots. This server does not terminate TLS; the operator's boundary does.
+- **It must be a bare origin, scheme and authority only.** A path, query, or userinfo is
+  refused at startup. `https` is the normal choice, and this server does not terminate
+  TLS — the operator's boundary does.
+- **`http` is accepted, and is only sound on a private segment.** An intermediary
+  admits a plaintext transfer descriptor only where it already reaches this
+  server's `/mcp` in cleartext over a pinned private address; it refuses one from
+  anywhere else. Whether that describes your deployment is a fact about its topology
+  that this server cannot observe, so configuring `http` is your assertion that it does.
 - **It should be the origin `/mcp` is already served on.** An intermediary reuses the
   addresses it pinned for the MCP connection only when the transfer descriptor names that
   same host; a descriptor naming a different host must resolve to a publicly routable

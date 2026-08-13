@@ -58,9 +58,17 @@ does an ordinary `matrix_submit_asset` call name the staged source.
 
 That route rides the same listener as `/mcp`, so it sits behind whatever authenticated
 boundary and TLS termination already front the service. `MATRIX_FILE_PUBLIC_URL` must be
-the HTTPS origin clients reach that boundary at, and should be the same host `/mcp` is
-served on — an intermediary reuses its pinned MCP addresses only for a descriptor naming
-that host, and otherwise requires a publicly routable one.
+the origin clients reach that boundary at, and should be the same host `/mcp` is served
+on — an intermediary reuses its pinned MCP addresses only for a descriptor naming that
+host, and otherwise requires a publicly routable one.
+
+Where there is no boundary in that path — this server running as a private sidecar an
+intermediary reaches directly over a container network, with no proxy and no TLS — the
+origin may be `http`. That is sound only because the intermediary already sends this
+server its tool arguments and file references in cleartext across the same segment, so
+the byte stream gives up nothing the control plane has not. It refuses a plaintext
+descriptor for any other kind of destination. This server cannot verify which case it is
+in, so configuring an `http` origin is the operator asserting it.
 
 The staging directory must be **dedicated to one server instance**, and writable — which
 the read-only root filesystem in the example Compose file does not provide by default.

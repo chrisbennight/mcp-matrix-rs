@@ -148,10 +148,20 @@ and no destination to get wrong. It also needs no per-deployment transfer config
 beyond this server's own public origin, and it is what the draft file-transfer contract
 already expects an upstream to do.
 
-The cost is that the plane only works where this server is reachable over HTTPS at a
-hostname an intermediary can dial — which means it is unavailable under `--stdio`, and
-that combination is refused at startup rather than silently minting descriptors nothing
-can reach.
+The cost is that the plane only works where this server is reachable at a hostname an
+intermediary can dial — which means it is unavailable under `--stdio`, and that
+combination is refused at startup rather than silently minting descriptors nothing can
+reach.
+
+That origin is normally HTTPS, terminated at the operator's boundary. It may also be
+plaintext, and this server does not judge which is appropriate, because it cannot: a
+plaintext descriptor is sound only where the intermediary already reaches this server's
+control plane in cleartext over a segment it trusts — a private sidecar with no proxy in
+the path — and that is a fact about the deployment's topology which this process cannot
+observe. It sees a configuration string. The intermediary knows the addresses it pinned
+and the scheme it dialled, and refuses a plaintext descriptor from anywhere else, so
+enforcement lives where the knowledge is. Configuring a plaintext origin is the operator
+asserting that fact, not a check performed here.
 
 ## Nothing is advertised when the transfer plane is off
 

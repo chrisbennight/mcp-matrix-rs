@@ -64,13 +64,17 @@ struct Args {
     )]
     allowed_hosts: Vec<String>,
 
-    /// Public HTTPS origin this server is reached at, which enables the transfer plane.
+    /// Public origin this server is reached at, which enables the transfer plane.
     ///
     /// Scheme and authority only, e.g. `https://panel.example.org`. Unset leaves the
     /// server inline-only. A trusted intermediary dials this to deliver media too large
     /// for a tool argument, and reuses the addresses it pinned for `/mcp` only when this
-    /// names that same host — so it should be the origin `/mcp` is already served on,
-    /// behind the operator's existing TLS boundary.
+    /// names that same host — so it should be the origin `/mcp` is already served on.
+    ///
+    /// `http` is accepted for a deployment whose intermediary reaches this server over a
+    /// private segment it already trusts in cleartext. Whether that holds is a property
+    /// of the topology this process cannot see, so it is the operator's assertion to
+    /// make; an intermediary refuses a plaintext descriptor from anywhere else.
     #[arg(long, env = "MATRIX_FILE_PUBLIC_URL")]
     file_public_url: Option<String>,
 
@@ -154,9 +158,12 @@ async fn main() -> Result<()> {
         ffprobe: args.ffprobe_bin.clone(),
     };
 
-    // The plane needs a listener to receive on and a TLS boundary in front of it, and
-    // stdio has neither. Refusing the combination beats starting a server that mints
-    // descriptors nothing can reach.
+    // The plane needs a listener to receive transfers on, and stdio has none — it
+    // speaks MCP over pipes to one spawning process and serves no HTTP at all.
+    // Refusing the combination beats starting a server that mints descriptors nothing
+    // can reach. (What fronts that listener is the operator's choice: a TLS boundary
+    // for a public origin, or nothing at all for a private segment an intermediary
+    // already reaches in cleartext.)
     if args.stdio && args.file_public_url.is_some() {
         anyhow::bail!(
             "--file-public-url needs the HTTP transport: under --stdio there is no \

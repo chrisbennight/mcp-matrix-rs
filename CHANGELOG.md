@@ -6,10 +6,12 @@ All notable changes to this project are documented in this file. The format foll
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-08-13
+
 ### Added
 
 - A governed transfer plane, off by default and enabled by setting
-  `MATRIX_FILE_PUBLIC_URL` to the public HTTPS origin this server is reached at.
+  `MATRIX_FILE_PUBLIC_URL` to the public origin this server is reached at.
   Media past the 16 KiB inline cap — GIFs and video, which by definition need a
   downscale — now reaches the panel without passing through a tool argument or
   model context. Bytes are pushed to this server, never fetched by it: a trusted
@@ -18,6 +20,12 @@ All notable changes to this project are documented in this file. The format foll
   there, and a later `matrix_submit_asset` names the staged source. A reference
   and an inline payload use the identical tool contract and return the identical
   report.
+- `MATRIX_FILE_PUBLIC_URL` accepts an `http` origin as well as `https`. A
+  plaintext origin is sound only where the intermediary already reaches this
+  server's `/mcp` in cleartext over a private segment it trusts — it refuses a
+  plaintext transfer descriptor from anywhere else. That is a property of the
+  deployment's topology which this server cannot observe, so configuring `http`
+  is the operator's assertion that it holds, not a check this server performs.
 - Settings `MATRIX_FILE_STAGING_DIR`, `MATRIX_FILE_TTL_SECS`, and
   `MATRIX_FILE_MAX_STAGED` bound where transfers are staged, how long an unused
   authorization or unconsumed transfer survives, and how many may be outstanding.
@@ -116,6 +124,8 @@ Initial public release.
 - Versioned container images published to `ghcr.io/chrisbennight/mcp-matrix-rs` on
   release tags.
 
-[Unreleased]: https://github.com/chrisbennight/mcp-matrix-rs/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/chrisbennight/mcp-matrix-rs/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/chrisbennight/mcp-matrix-rs/compare/v0.3.0...v0.4.0
+[0.3.0]: https://github.com/chrisbennight/mcp-matrix-rs/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/chrisbennight/mcp-matrix-rs/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/chrisbennight/mcp-matrix-rs/releases/tag/v0.1.0

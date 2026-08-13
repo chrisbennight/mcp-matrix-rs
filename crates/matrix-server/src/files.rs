@@ -312,20 +312,34 @@ pub struct FilePlane {
     consuming: Arc<std::sync::atomic::AtomicUsize>,
 }
 
-/// Reject anything that is not a bare `https` origin.
+/// Reject anything that is not a bare origin.
 ///
 /// The descriptor URL is what a trusted intermediary will dial and what its own policy
-/// checks; a path, query, or userinfo here would either be dropped or refused there, and
-/// a plaintext origin is refused outright. Failing at startup beats minting descriptors
-/// that every transfer rejects.
+/// checks; a path, query, or userinfo here would either be dropped or refused there.
+/// Failing at startup beats minting descriptors that every transfer rejects.
+///
+/// Both `https` and `http` are accepted — see the scheme check below for why this server
+/// does not judge which is appropriate.
 pub fn validate_public_origin(origin: &str) -> Result<String, String> {
     // Parsed rather than pattern-matched. Prefix and character checks admit strings that
     // look like origins without naming one — `https://:` and `https://[::1` among them —
     // and the first sign of that would be an intermediary refusing every descriptor.
     let parsed = url::Url::parse(origin).map_err(|e| format!("is not a URL: {e}"))?;
 
-    if parsed.scheme() != "https" {
-        return Err(format!("must use https, got {:?}", parsed.scheme()));
+    // `http` is accepted as well as `https`, and this server does not try to decide
+    // whether that is wise. A plaintext origin is only sound where the intermediary
+    // reaches this server the same way — over a private segment it already trusts in
+    // cleartext — and that is a fact about the deployment's topology, which this process
+    // cannot see. It knows only the string it was handed. Enforcement belongs where the
+    // knowledge is: the intermediary knows how it dialled and refuses a plaintext
+    // descriptor from anywhere else. Refusing `http` here would not add a check, it would
+    // only make the arrangement impossible to configure.
+    if !matches!(parsed.scheme(), "https" | "http") {
+        return Err(format!(
+            "must use https, or http on a network the intermediary already trusts in \
+             cleartext, got {:?}",
+            parsed.scheme()
+        ));
     }
     if parsed.host_str().is_none_or(str::is_empty) {
         return Err("must name a host".into());
@@ -341,9 +355,10 @@ pub fn validate_public_origin(origin: &str) -> Result<String, String> {
     // Rebuilt from the parse so the stored value is exactly what descriptors are built
     // from, with any default port and trailing slash normalised away.
     let host = parsed.host_str().expect("checked above");
+    let scheme = parsed.scheme();
     Ok(match parsed.port() {
-        Some(port) => format!("https://{host}:{port}"),
-        None => format!("https://{host}"),
+        Some(port) => format!("{scheme}://{host}:{port}"),
+        None => format!("{scheme}://{host}"),
     })
 }
 
@@ -389,6 +404,18 @@ impl FilePlane {
             staged: Mutex::new(HashMap::new()),
             consuming: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }))
+    }
+
+    /// The transport a descriptor declares, taken from the configured origin.
+    ///
+    /// Both are `&'static str` because both are literals; the origin is validated at
+    /// startup, so anything that is not `https` is `http` by elimination.
+    fn descriptor_transport(&self) -> &'static str {
+        if self.config.public_origin.starts_with("https://") {
+            "https"
+        } else {
+            "http"
+        }
     }
 
     /// Mint a single-use authorization for one transfer.
@@ -488,7 +515,11 @@ impl FilePlane {
                 digest: params.digest,
             },
             upload: TransferDescriptor {
-                transport: "https",
+                // The scheme the URL actually uses. A descriptor that declares one
+                // protection level and names another is refused by an intermediary that
+                // admits plaintext at all — it requires the two to agree, precisely so a
+                // transfer cannot run in the clear under a descriptor claiming TLS.
+                transport: self.descriptor_transport(),
                 method: "PUT",
                 url,
                 // The only authority on the ingest route. It travels in a header rather
@@ -975,12 +1006,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_plaintext_origin_yields_a_descriptor_that_agrees_with_itself() {
+        // The transport was a constant while the URL followed the origin, so an http
+        // deployment emitted `transport: "https"` against an `http://` URL. An
+        // intermediary that admits plaintext at all requires the two to agree —
+        // otherwise a transfer could run in the clear under a descriptor claiming TLS —
+        // so that descriptor is refused and the plaintext sidecar this release exists
+        // to enable would never have worked.
+        let plane = FilePlane::new(FileConfig {
+            public_origin: "http://matrix-mcp:8080".into(),
+            staging_dir: scratch("plaintext-descriptor"),
+            ttl: Duration::from_secs(300),
+            max_staged: 4,
+            max_source_bytes: 1024,
+        })
+        .await
+        .expect("plane");
+
+        let authorized = plane.authorize_upload(params(4, None)).await.expect("ok");
+        assert_eq!(authorized.upload.transport, "http");
+        assert!(
+            authorized
+                .upload
+                .url
+                .starts_with("http://matrix-mcp:8080/files/upload/"),
+            "{}",
+            authorized.upload.url
+        );
+
+        // The declared transport is the URL's scheme, whichever it is.
+        let scheme = authorized
+            .upload
+            .url
+            .split_once("://")
+            .expect("an absolute URL")
+            .0;
+        assert_eq!(authorized.upload.transport, scheme);
+    }
+
+    #[tokio::test]
     async fn the_descriptor_points_at_the_configured_origin_and_carries_its_own_authority() {
         let plane = plane("descriptor", 1024).await;
         let authorized = plane.authorize_upload(params(4, None)).await.expect("ok");
 
         assert_eq!(authorized.upload.transport, "https");
         assert_eq!(authorized.upload.method, "PUT");
+        assert!(
+            authorized.upload.url.starts_with("https://"),
+            "the declared transport is the URL's scheme: {}",
+            authorized.upload.url
+        );
         assert!(
             authorized
                 .upload
@@ -1509,10 +1584,17 @@ mod tests {
     }
 
     #[test]
-    fn only_a_bare_https_origin_is_accepted() {
+    fn only_a_bare_origin_is_accepted_over_either_scheme() {
         assert_eq!(
             validate_public_origin("https://panel.example/").expect("trailing slash trimmed"),
             "https://panel.example"
+        );
+        // Plaintext is accepted and kept: a descriptor built from it has to name the
+        // scheme the intermediary will actually dial, and an intermediary that admits
+        // plaintext at all requires the declared transport and the URL to agree.
+        assert_eq!(
+            validate_public_origin("http://matrix-mcp:8080").expect("plaintext origin"),
+            "http://matrix-mcp:8080"
         );
         assert_eq!(
             validate_public_origin("https://panel.example:8443")
@@ -1520,7 +1602,7 @@ mod tests {
             "https://panel.example:8443"
         );
         for bad in [
-            "http://panel.example",
+            "ftp://panel.example",
             "https://user:pw@panel.example",
             "https://panel.example/files",
             "https://panel.example?x=1",
