@@ -1145,3 +1145,152 @@ async fn a_configured_server_advertises_the_file_input_on_its_source_property() 
 
     let _ = std::fs::remove_dir_all(&scratch);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_bare_uri_string_submits_exactly_as_the_object_carrying_it_does() {
+    let panel = UdpSocket::bind("127.0.0.1:0").await.expect("bind panel");
+    let panel_addr = panel.local_addr().expect("panel addr");
+    let base = fake_panel(PANEL_INFO);
+    let scratch = std::env::temp_dir().join(format!("matrix-str-{}", std::process::id()));
+    std::fs::create_dir_all(&scratch).expect("scratch");
+    let binaries = stand_in_binaries(&scratch);
+
+    let engine = Engine::new(
+        canvas(),
+        Rate::new(25).expect("rate"),
+        matrix_device::WledClient::new(base, Duration::from_millis(500)).expect("client"),
+        panel_addr,
+    );
+    let server =
+        WireServer::start_with_files(engine, binaries, wire_plane("string-form").await).await;
+
+    let inline = format!(
+        "data:image/gif;base64,{}",
+        base64::engine::general_purpose::STANDARD.encode(b"stand-in source")
+    );
+
+    // The draft's form and the intermediary's form, over the real transport.
+    let as_string = tool_payload(
+        &server
+            .call_tool(
+                "matrix_submit_asset",
+                serde_json::json!({ "source": inline }),
+            )
+            .await,
+    );
+    let as_object = tool_payload(
+        &server
+            .call_tool(
+                "matrix_submit_asset",
+                serde_json::json!({ "source": { "uri": inline } }),
+            )
+            .await,
+    );
+
+    // Handles differ by construction; everything describing the asset must not.
+    let describing = |report: &serde_json::Value| {
+        serde_json::json!({
+            "frames": report["frames"],
+            "fps": report["fps"],
+            "duration_ms": report["duration_ms"],
+            "media_type": report["media_type"],
+            "source_bytes": report["source_bytes"],
+        })
+    };
+    assert_eq!(
+        describing(&as_string),
+        describing(&as_object),
+        "the two shapes must produce the same asset: {as_string} vs {as_object}"
+    );
+
+    // And a staged reference works in the string form too, which is the whole point:
+    // a direct client can now use the transfer plane without an intermediary translating
+    // its arguments.
+    let payload = vec![0x5Au8; matrix_server::tools::MAX_INLINE_BYTES * 2];
+    let authorized = server
+        .rpc(
+            "files/authorizeUpload",
+            None,
+            serde_json::json!({ "mimeType": "image/gif" }),
+        )
+        .await;
+    let result = &authorized["result"];
+    let uri = result["file"]["uri"]
+        .as_str()
+        .expect("staged uri")
+        .to_string();
+    let credential = result["upload"]["headers"][matrix_server::files::TRANSFER_CREDENTIAL_HEADER]
+        .as_str()
+        .expect("credential")
+        .to_string();
+    let upload_id = result["upload"]["url"]
+        .as_str()
+        .expect("url")
+        .rsplit('/')
+        .next()
+        .expect("upload identifier");
+
+    let upload = server
+        .client
+        .put(format!("{}/files/upload/{upload_id}", server.base))
+        .header(
+            matrix_server::files::TRANSFER_CREDENTIAL_HEADER,
+            &credential,
+        )
+        .body(payload.clone())
+        .send()
+        .await
+        .expect("upload");
+    assert_eq!(upload.status().as_u16(), 204);
+
+    let staged = tool_payload(
+        &server
+            .call_tool("matrix_submit_asset", serde_json::json!({ "source": uri }))
+            .await,
+    );
+    assert_eq!(
+        staged["source_bytes"].as_u64(),
+        Some(payload.len() as u64),
+        "a staged reference submits as a bare string: {staged}"
+    );
+    assert_eq!(staged["media_type"], "image/gif");
+
+    let _ = std::fs::remove_dir_all(&scratch);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_string_form_is_no_route_around_the_source_boundary() {
+    let panel = UdpSocket::bind("127.0.0.1:0").await.expect("bind panel");
+    let panel_addr = panel.local_addr().expect("panel addr");
+    let base = fake_panel(PANEL_INFO);
+    let scratch = std::env::temp_dir().join(format!("matrix-strref-{}", std::process::id()));
+    std::fs::create_dir_all(&scratch).expect("scratch");
+    let binaries = stand_in_binaries(&scratch);
+
+    let engine = Engine::new(
+        canvas(),
+        Rate::new(25).expect("rate"),
+        matrix_device::WledClient::new(base, Duration::from_millis(500)).expect("client"),
+        panel_addr,
+    );
+    let server =
+        WireServer::start_with_files(engine, binaries, wire_plane("string-refuse").await).await;
+
+    // Writing a reference differently must not change what a reference may name.
+    for uri in [
+        "https://example.invalid/clip.gif",
+        "http://127.0.0.1:1/clip.gif",
+        "file:///etc/passwd",
+        "matrix-file://staged/fabricated-identifier",
+    ] {
+        let response = server
+            .call_tool("matrix_submit_asset", serde_json::json!({ "source": uri }))
+            .await;
+        assert_eq!(
+            response["error"]["data"]["code"], "matrix_unsupported_source",
+            "{uri} as a bare string must be refused: {response}"
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&scratch);
+}

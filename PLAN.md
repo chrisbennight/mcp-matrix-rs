@@ -61,12 +61,6 @@ that expose it beyond loopback provide authentication and TLS at a trusted bound
 
 ## Future work
 
-**Interoperable file inputs for direct clients.** The draft contract the transfer plane
-implements declares a file-valued tool input as a URI *string*; this server's `source` is
-an object, which the operator's intermediary translates but a plain draft client would not
-understand. Accepting both shapes would make the plane usable without an intermediary in
-front of it.
-
 **Contention arbitration.** Priority, deduplication, duration caps, preemption, and the
 scheduler that would apply them. `Playout` drives one sequence at a time and holds it
 until the sequence ends or a send budget is reached. No policy currently arbitrates
