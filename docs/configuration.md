@@ -45,9 +45,15 @@ running the standalone binary with a deliberately selected installation.
 
 ## Decoder address space
 
-Each decode runs as a subprocess under an address-space ceiling, so a source that
-declares an enormous frame is refused by the kernel instead of exhausting the container.
-`MATRIX_DECODER_ADDRESS_SPACE_MB` sets that ceiling.
+On Linux, each decode runs as a subprocess under an address-space ceiling, so a source
+that declares an enormous frame is refused by the kernel instead of exhausting the
+container. `MATRIX_DECODER_ADDRESS_SPACE_MB` sets that ceiling.
+
+**The ceiling is enforced only on Linux.** The setting is accepted everywhere, but no
+kernel bound is applied on other targets — macOS rejects `setrlimit(RLIMIT_AS)` outright,
+so applying it would fail the spawn rather than bound it. The decode deadline and the
+output ceilings still apply there. See [compatibility](compatibility.md#operating-systems);
+Linux is the supported runtime for untrusted media, and nothing below changes that.
 
 **The default is sized for an eight-core host, and the requirement follows the host, not
 the media.** FFmpeg sizes its worker threads from the CPU count it can see, and glibc

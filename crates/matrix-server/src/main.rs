@@ -48,7 +48,9 @@ struct Args {
     #[arg(long, env = "MATRIX_DEVICE_TIMEOUT_MS", default_value_t = 3000)]
     device_timeout_ms: u64,
 
-    /// Address-space ceiling, in MiB, imposed on each decoder subprocess.
+    /// Address-space ceiling, in MiB, imposed on each decoder subprocess. Enforced on
+    /// Linux only; accepted but inert elsewhere, where the deadline and output ceilings
+    /// still apply.
     ///
     /// The default is sized for an eight-core host. What FFmpeg reserves is mostly a
     /// startup cost that follows the host's visible CPU count rather than the media, so

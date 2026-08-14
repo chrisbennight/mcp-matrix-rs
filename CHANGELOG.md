@@ -26,7 +26,9 @@ All notable changes to this project are documented in this file. The format foll
 - `MATRIX_DECODER_ADDRESS_SPACE_MB` sets the decoder's address-space ceiling. The
   requirement follows the host rather than the media, so a machine with
   substantially more than eight cores may need it raised; the configuration and
-  deployment documents cover the symptom and how to size it.
+  deployment documents cover the symptom and how to size it. As before, the
+  ceiling is enforced on Linux only — the setting is accepted but inert on other
+  targets, where the deadline and output ceilings still bound a decode.
 
 ## [0.4.0] - 2026-08-13
 
