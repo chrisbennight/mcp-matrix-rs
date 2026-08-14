@@ -6,7 +6,7 @@
 
 use crate::state::{Engine, EngineError};
 use base64::Engine as _;
-use matrix_media::{Limits, NormalizeParams};
+use matrix_media::NormalizeParams;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::Duration;
@@ -383,7 +383,7 @@ pub async fn submit_asset(
     let params = NormalizeParams {
         canvas: engine.canvas,
         rate: engine.target_rate,
-        limits: Limits::default(),
+        limits: engine.media_limits,
     };
 
     // The permit spans only the decode, not the asset store: it exists to bound
@@ -445,7 +445,9 @@ pub async fn list_assets(engine: &Arc<Engine>) -> Vec<AssetReport> {
 /// The frame budget every text ingest path renders under — the same cap the media
 /// path decodes under, derived from the engine's canvas and target rate.
 fn text_frame_budget(engine: &Arc<Engine>) -> u64 {
-    Limits::default().frame_cap_for_frame_size(engine.target_rate.fps(), engine.canvas.byte_len())
+    engine
+        .media_limits
+        .frame_cap_for_frame_size(engine.target_rate.fps(), engine.canvas.byte_len())
 }
 
 /// Mint, optionally play, then store a rendered text sequence.

@@ -86,6 +86,20 @@ pub struct Limits {
     /// but neither constrains the decoder's own allocations. A source declaring an
     /// enormous frame can exhaust the container inside FFmpeg before either check runs,
     /// so the limit is imposed on the child by the kernel rather than by watching it.
+    ///
+    /// Most of what FFmpeg reserves is a startup cost that does not follow the source.
+    /// Worker threads are sized from the host's visible CPU count, and glibc reserves a
+    /// 64 MiB arena per thread. Measured across a 3600-fold range of source pixels the
+    /// requirement moves by single-digit percent, while going from one visible core to
+    /// eight nearly doubles it. A ceiling set to cover only the decode therefore fails
+    /// at startup on a wider host instead of refusing the pathological source it exists
+    /// for, and it fails for scaled media first, because the scale filter is what adds
+    /// the threads.
+    ///
+    /// The default is sized for an eight-core host with headroom, and is deliberately
+    /// well above what any admissible source needs: `max_source_dimension` squared at
+    /// three bytes per pixel is under a quarter of it, so a frame far beyond that is
+    /// still refused. Operators on wider machines may have to raise it.
     pub decoder_address_space_bytes: u64,
 }
 
@@ -98,7 +112,7 @@ impl Default for Limits {
             max_frames: 1_800,
             decode_timeout: Duration::from_secs(30),
             max_normalized_bytes: 48 * 1024 * 1024,
-            decoder_address_space_bytes: 1024 * 1024 * 1024,
+            decoder_address_space_bytes: 2 * 1024 * 1024 * 1024,
         }
     }
 }

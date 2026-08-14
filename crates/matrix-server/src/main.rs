@@ -48,6 +48,19 @@ struct Args {
     #[arg(long, env = "MATRIX_DEVICE_TIMEOUT_MS", default_value_t = 3000)]
     device_timeout_ms: u64,
 
+    /// Address-space ceiling, in MiB, imposed on each decoder subprocess.
+    ///
+    /// The default is sized for an eight-core host. What FFmpeg reserves is mostly a
+    /// startup cost that follows the host's visible CPU count rather than the media, so
+    /// a wider machine may need this raised. The symptom is `media_decoder_failed` on
+    /// media that should decode, scaled sources first.
+    #[arg(
+        long,
+        env = "MATRIX_DECODER_ADDRESS_SPACE_MB",
+        default_value_t = matrix_media::Limits::default().decoder_address_space_bytes / (1024 * 1024)
+    )]
+    decoder_address_space_mb: u64,
+
     #[arg(long, env = "MATRIX_FFMPEG_BIN", default_value = "ffmpeg")]
     ffmpeg_bin: String,
 
@@ -106,6 +119,27 @@ struct Args {
     stdio: bool,
 }
 
+/// Resolve the decode bounds from the operator's configuration.
+///
+/// Only the address-space ceiling is configurable: it is the one bound that depends on
+/// the host FFmpeg runs on rather than on the canvas or the media.
+fn media_limits(args: &Args) -> Result<matrix_media::Limits> {
+    let decoder_address_space_bytes = args
+        .decoder_address_space_mb
+        .checked_mul(1024 * 1024)
+        .with_context(|| {
+            format!(
+                "decoder address space {} MiB overflows",
+                args.decoder_address_space_mb
+            )
+        })?;
+
+    Ok(matrix_media::Limits {
+        decoder_address_space_bytes,
+        ..matrix_media::Limits::default()
+    })
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -147,7 +181,7 @@ async fn main() -> Result<()> {
     )
     .context("WLED base URL")?;
 
-    let engine = Engine::new(canvas, rate, wled, args.ddp_addr);
+    let engine = Engine::with_media_limits(canvas, rate, wled, args.ddp_addr, media_limits(&args)?);
 
     // Without this the reported framerate never changes and rate adaptation has nothing
     // to adapt to. It is part of the running server, not a diagnostic.
@@ -260,6 +294,65 @@ mod tests {
             .collect();
 
         assert_eq!(defaults, [Some("127.0.0.1:8080")]);
+    }
+
+    fn args_with(extra: &[&str]) -> Args {
+        let mut argv = vec![
+            "matrix-server",
+            "--wled-url",
+            "http://127.0.0.1:1",
+            "--ddp-addr",
+            "127.0.0.1:4048",
+        ];
+        argv.extend_from_slice(extra);
+        Args::try_parse_from(argv).expect("args parse")
+    }
+
+    /// An operator raising the ceiling for a wide host has to actually reach the
+    /// decoder. Read as MiB and applied as bytes, so a unit slip is a 1,048,576-fold
+    /// error rather than a near miss.
+    #[test]
+    fn decoder_address_space_is_configured_in_mebibytes() {
+        let limits = media_limits(&args_with(&["--decoder-address-space-mb", "6144"]))
+            .expect("limits resolve");
+
+        assert_eq!(limits.decoder_address_space_bytes, 6144 * 1024 * 1024);
+    }
+
+    /// The ceiling has to clear FFmpeg's own startup reservation, not just the frames
+    /// it decodes: worker threads are sized from the host's CPU count and each costs a
+    /// 64 MiB arena, so a bound covering only an admissible frame refuses every scaled
+    /// source on an ordinary host. Measured against an eight-core host, which is what
+    /// the default targets.
+    #[test]
+    fn default_ceiling_clears_startup_reservation_not_just_the_largest_frame() {
+        let limits = matrix_media::Limits::default();
+        let largest_frame =
+            u64::from(limits.max_source_dimension) * u64::from(limits.max_source_dimension) * 3;
+
+        assert!(
+            limits.decoder_address_space_bytes >= 2 * 1024 * 1024 * 1024,
+            "ceiling {} is below what an eight-core host needs to initialize FFmpeg",
+            limits.decoder_address_space_bytes
+        );
+        assert!(
+            limits.decoder_address_space_bytes > largest_frame * 4,
+            "ceiling {} leaves no room beyond the largest admissible frame ({largest_frame})",
+            limits.decoder_address_space_bytes
+        );
+    }
+
+    /// A ceiling that admits a frame beyond `max_source_dimension` would make the limit
+    /// decorative — the refusal it exists for has to stay reachable.
+    #[test]
+    fn ceiling_still_refuses_a_frame_beyond_the_admitted_dimension() {
+        let limits = matrix_media::Limits::default();
+        let pathological = 30_000u64 * 30_000 * 3;
+
+        assert!(
+            pathological > limits.decoder_address_space_bytes,
+            "a {pathological}-byte frame must not fit under the ceiling"
+        );
     }
 
     #[test]
