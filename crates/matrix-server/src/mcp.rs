@@ -393,7 +393,7 @@ fn annotate_file_input(tool: &mut rmcp::model::Tool) {
     // places always drifts — only one of them got updated. `the_advertised_version_is_
     // the_crate_version` fails the build when they disagree, which is the part that
     // stops it happening again.
-    version = "0.4.0",
+    version = "0.4.1",
     instructions = "Renders media to a WLED LED matrix. Submit media to get an asset \
                     handle, then play that handle. Playback is paced by the framerate \
                     the panel reports and each frame is clamped to the panel's power \
