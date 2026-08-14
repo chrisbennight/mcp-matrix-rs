@@ -6,6 +6,30 @@ All notable changes to this project are documented in this file. The format foll
 
 ## [Unreleased]
 
+### Fixed
+
+- Media that needs a downscale — every GIF and video, and the reason the transfer
+  plane exists — failed to decode with `media_decoder_failed` on an ordinary
+  multi-core host. The decoder's address-space ceiling was 1 GiB, which is below
+  what FFmpeg reserves before it decodes anything: worker threads are sized from
+  the host's visible CPU count and glibc reserves a 64 MiB arena per thread.
+  Across a 3600-fold range of source pixels the requirement moves by single-digit
+  percent, while one visible core to eight nearly doubles it, so the ceiling was
+  refusing FFmpeg's startup rather than the enormous declared frame it exists to
+  refuse. Scaled sources failed first because the scale filter is what adds the
+  threads, which is why panel-sized stills kept working. The default is now 2 GiB,
+  sized for an eight-core host and still far below a frame beyond
+  `max_source_dimension`.
+
+### Added
+
+- `MATRIX_DECODER_ADDRESS_SPACE_MB` sets the decoder's address-space ceiling. The
+  requirement follows the host rather than the media, so a machine with
+  substantially more than eight cores may need it raised; the configuration and
+  deployment documents cover the symptom and how to size it. As before, the
+  ceiling is enforced on Linux only — the setting is accepted but inert on other
+  targets, where the deadline and output ceilings still bound a decode.
+
 ## [0.4.0] - 2026-08-13
 
 ### Added

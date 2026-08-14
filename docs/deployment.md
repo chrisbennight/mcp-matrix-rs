@@ -38,9 +38,17 @@ gain, uses a read-only root filesystem, and provides only a temporary `/tmp`.
 Set deployment-specific memory, CPU, and process limits based on the configured canvas.
 The default decode path permits up to 24 MiB of stored frames while bounding the
 temporary raw-plus-assembled peak at 48 MiB. The in-memory store retains at most eight
-assets, and each decoder receives a 1 GiB virtual address-space ceiling on Linux. Do not
+assets, and each decoder receives a 2 GiB virtual address-space ceiling on Linux. Do not
 choose a container memory limit without exercising concurrent decode and playback at the
 configured canvas size.
+
+That address-space ceiling is virtual, not resident, and it is the one limit here that
+depends on the host rather than on the canvas: FFmpeg sizes its worker threads from the
+CPUs it can see, and each thread costs a 64 MiB glibc arena reservation. The default
+suits an eight-core host. On a machine with substantially more cores, decodes that need
+a downscale — which is every GIF and video — can fail while panel-sized stills still
+succeed. `MATRIX_DECODER_ADDRESS_SPACE_MB` in [configuration](configuration.md#decoder-address-space)
+covers the symptom and how to size it.
 
 The decoder receives no inherited environment and cannot fetch a caller-selected URL.
 The MCP tool surface resolves a base64 `data:` URI, and — when the transfer plane is

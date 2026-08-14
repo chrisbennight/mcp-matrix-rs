@@ -120,6 +120,10 @@ const DECODE_QUEUE_DEADLINE: Duration = Duration::from_secs(45);
 pub struct Engine {
     pub canvas: Canvas,
     pub target_rate: Rate,
+    /// Bounds every decode this engine runs. Held here rather than taken from
+    /// `Limits::default()` at each call site so an operator's tuning reaches the
+    /// decoder; the address-space ceiling has to track the host FFmpeg runs on.
+    pub media_limits: matrix_media::Limits,
     wled: WledClient,
     ddp_target: SocketAddr,
     feedback: FpsFeedback,
@@ -166,9 +170,26 @@ impl Engine {
         wled: WledClient,
         ddp_target: SocketAddr,
     ) -> Arc<Self> {
+        Self::with_media_limits(
+            canvas,
+            target_rate,
+            wled,
+            ddp_target,
+            matrix_media::Limits::default(),
+        )
+    }
+
+    pub fn with_media_limits(
+        canvas: Canvas,
+        target_rate: Rate,
+        wled: WledClient,
+        ddp_target: SocketAddr,
+        media_limits: matrix_media::Limits,
+    ) -> Arc<Self> {
         Arc::new(Self {
             canvas,
             target_rate,
+            media_limits,
             wled,
             ddp_target,
             feedback: FpsFeedback::new(),

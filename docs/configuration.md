@@ -13,6 +13,7 @@ variable listed below. Run `matrix-server --help` for the corresponding option n
 | `MATRIX_HEIGHT` | no | `64` | Render canvas height in pixels |
 | `MATRIX_TARGET_FPS` | no | `25` | Requested whole-frame rate from 1 through 240 |
 | `MATRIX_DEVICE_TIMEOUT_MS` | no | `3000` | Timeout for WLED JSON API calls |
+| `MATRIX_DECODER_ADDRESS_SPACE_MB` | no | `2048` | Address-space ceiling imposed on each decoder subprocess. Raise it on a host with many CPUs; see below |
 | `MATRIX_FFMPEG_BIN` | no | `ffmpeg` | FFmpeg executable path |
 | `MATRIX_FFPROBE_BIN` | no | `ffprobe` | ffprobe executable path |
 | `MATRIX_STDIO` | no | off | Serve MCP over stdio to the spawning client instead of listening on HTTP |
@@ -41,6 +42,43 @@ stdout stays valid JSON-RPC.
 
 The container pins FFmpeg and ffprobe to `/usr/bin`. Override their paths only when
 running the standalone binary with a deliberately selected installation.
+
+## Decoder address space
+
+On Linux, each decode runs as a subprocess under an address-space ceiling, so a source
+that declares an enormous frame is refused by the kernel instead of exhausting the
+container. `MATRIX_DECODER_ADDRESS_SPACE_MB` sets that ceiling.
+
+**The ceiling is enforced only on Linux.** The setting is accepted everywhere, but no
+kernel bound is applied on other targets — macOS rejects `setrlimit(RLIMIT_AS)` outright,
+so applying it would fail the spawn rather than bound it. The decode deadline and the
+output ceilings still apply there. See [compatibility](compatibility.md#operating-systems);
+Linux is the supported runtime for untrusted media, and nothing below changes that.
+
+**The default is sized for an eight-core host, and the requirement follows the host, not
+the media.** FFmpeg sizes its worker threads from the CPU count it can see, and glibc
+reserves a 64 MiB malloc arena per thread, so nearly all of the reservation is a startup
+cost. Across a 3600-fold range of source pixels the requirement moves by single-digit
+percent; going from one visible core to eight nearly doubles it. A machine with many
+more cores than eight can therefore need a higher ceiling for exactly the same media.
+
+The symptom is `media_decoder_failed` with FFmpeg reporting `Resource temporarily
+unavailable`, `ff_frame_thread_encoder_init failed`, or a filter that could not be
+configured. **Scaled sources fail first, and a native-resolution still may keep working**
+— the scale filter is what adds the threads — so the failure looks like it depends on the
+media when it depends on the host. If large media fails while panel-sized stills succeed,
+raise this before looking anywhere else.
+
+To find a working value on a specific host, run the decoder's own filtergraph under a
+candidate ceiling and raise it until it succeeds:
+
+```bash
+( ulimit -v $((2048 * 1024)); ffmpeg -nostdin -i source.png -vf "fps=25,scale=64:64:flags=area,format=rgb24" -f rawvideo -y /dev/null )
+```
+
+Raising this weakens the bound it provides, so raise it to what the host needs rather
+than to an arbitrarily large number. Limiting the CPUs the container can see is the other
+lever, and it lowers the requirement, but it also costs decode throughput.
 
 ## The transfer plane
 
