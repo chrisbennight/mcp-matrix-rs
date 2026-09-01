@@ -9,9 +9,10 @@
 use crate::state::Engine;
 use crate::tools::{self, FileValue, RegionParam};
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{CacheScope, ListToolsResult, PaginatedRequestParams};
+use rmcp::model::{CacheScope, ListToolsResult, PaginatedRequestParams, Tool};
 use rmcp::service::RequestContext;
 use rmcp::{ErrorData as McpError, RoleServer, ServerHandler, tool, tool_handler, tool_router};
+use serde_json::{Map, Value, json};
 use std::sync::Arc;
 
 /// Binaries the media path shells out to, resolved once at startup.
@@ -386,6 +387,148 @@ fn annotate_file_input(tool: &mut rmcp::model::Tool) {
     );
 }
 
+fn catalog_tools(files_enabled: bool) -> Vec<Tool> {
+    let mut tools = MatrixHandler::tool_router().list_all();
+    tools.sort_by(|a, b| a.name.cmp(&b.name));
+    for tool in &mut tools {
+        normalize_tool_schemas(tool);
+        if files_enabled && tool.name == "matrix_submit_asset" {
+            annotate_file_input(tool);
+        }
+    }
+    tools
+}
+
+fn normalize_tool_schemas(tool: &mut Tool) {
+    tool.input_schema = portable_schema_map(&tool.input_schema);
+    if let Some(output_schema) = tool.output_schema.as_ref() {
+        tool.output_schema = Some(portable_schema_map(output_schema));
+    }
+}
+
+fn portable_schema_map(schema: &Arc<Map<String, Value>>) -> Arc<Map<String, Value>> {
+    let mut schema = Value::Object((**schema).clone());
+    normalize_portable_schema(&mut schema, None);
+    match schema {
+        Value::Object(object) => Arc::new(object),
+        _ => unreachable!("an MCP root schema is an object"),
+    }
+}
+
+/// Publish semantically equivalent object schemas where strict MCP clients do
+/// not consume legal JSON Schema boolean schemas or array-valued type unions.
+fn normalize_portable_schema(schema: &mut Value, parent_keyword: Option<&str>) {
+    if let Value::Bool(accepts_everything) = schema {
+        if parent_keyword.is_some_and(|keyword| BOOLEAN_SCHEMA_KEYWORDS.contains(&keyword)) {
+            return;
+        }
+        *schema = if *accepts_everything {
+            json!({
+                "anyOf": JSON_SCHEMA_TYPES
+                    .iter()
+                    .map(|name| json!({"type": name}))
+                    .collect::<Vec<_>>()
+            })
+        } else {
+            json!({"not": {}})
+        };
+        return;
+    }
+
+    let Some(object) = schema.as_object_mut() else {
+        return;
+    };
+    let portable_types = object.get("type").and_then(|value| {
+        let values = value.as_array()?;
+        let mut types: Vec<String> = Vec::with_capacity(values.len());
+        for value in values {
+            let name = value.as_str()?;
+            if !JSON_SCHEMA_TYPES.contains(&name) || types.iter().any(|item| item == name) {
+                return None;
+            }
+            types.push(name.to_owned());
+        }
+        (!types.is_empty()).then_some(types)
+    });
+    if let Some(types) = portable_types {
+        object.remove("type");
+        let branches = Value::Array(
+            types
+                .into_iter()
+                .map(|name| json!({"type": name}))
+                .collect(),
+        );
+        if object.contains_key("anyOf") {
+            object
+                .entry("allOf")
+                .or_insert_with(|| Value::Array(Vec::new()))
+                .as_array_mut()
+                .expect("a generated allOf schema must be an array")
+                .push(json!({"anyOf": branches}));
+        } else {
+            object.insert("anyOf".to_owned(), branches);
+        }
+    }
+
+    for keyword in [
+        "$defs",
+        "definitions",
+        "properties",
+        "patternProperties",
+        "dependentSchemas",
+        "dependencies",
+    ] {
+        if let Some(children) = object.get_mut(keyword).and_then(Value::as_object_mut) {
+            for child in children.values_mut() {
+                normalize_portable_schema(child, Some(keyword));
+            }
+        }
+    }
+    for keyword in ["allOf", "anyOf", "oneOf", "prefixItems"] {
+        if let Some(children) = object.get_mut(keyword).and_then(Value::as_array_mut) {
+            for child in children {
+                normalize_portable_schema(child, Some(keyword));
+            }
+        }
+    }
+    if let Some(items) = object.get_mut("items") {
+        if let Some(children) = items.as_array_mut() {
+            for child in children {
+                normalize_portable_schema(child, Some("items"));
+            }
+        } else {
+            normalize_portable_schema(items, Some("items"));
+        }
+    }
+    for keyword in [
+        "contains",
+        "propertyNames",
+        "not",
+        "if",
+        "then",
+        "else",
+        "contentSchema",
+        "additionalProperties",
+        "unevaluatedProperties",
+        "additionalItems",
+        "unevaluatedItems",
+    ] {
+        if let Some(child) = object.get_mut(keyword) {
+            normalize_portable_schema(child, Some(keyword));
+        }
+    }
+}
+
+const BOOLEAN_SCHEMA_KEYWORDS: [&str; 4] = [
+    "additionalProperties",
+    "unevaluatedProperties",
+    "additionalItems",
+    "unevaluatedItems",
+];
+const JSON_SCHEMA_TYPES: [&str; 7] = [
+    "null", "boolean", "object", "array", "number", "string", "integer",
+];
+
 #[tool_handler(
     name = "matrix-server",
     // The macro takes a literal, so this cannot read the crate metadata directly. It
@@ -461,20 +604,10 @@ impl ServerHandler for MatrixHandler {
     ) -> Result<ListToolsResult, McpError> {
         // Deterministic order so a client cache and an LLM prompt cache both hit; the
         // router yields registration order, which is stable per build but not sorted.
-        let mut tools = Self::tool_router().list_all();
-        tools.sort_by(|a, b| a.name.cmp(&b.name));
-
-        // The annotation is what makes an intermediary offer this tool a file at all, so
-        // it appears only where the transfer plane can actually receive one. An
-        // inline-only deployment therefore publishes exactly the schema it publishes
-        // today, rather than advertising a capability it would then refuse.
-        if self.files.is_some() {
-            for tool in &mut tools {
-                if tool.name == "matrix_submit_asset" {
-                    annotate_file_input(tool);
-                }
-            }
-        }
+        // The file annotation appears only where the transfer plane can actually
+        // receive one. An inline-only deployment therefore does not advertise an
+        // upload capability it would then refuse.
+        let tools = catalog_tools(self.files.is_some());
 
         Ok(ListToolsResult {
             tools,
@@ -489,7 +622,207 @@ impl ServerHandler for MatrixHandler {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
     use super::*;
+
+    const CONSTRAINING_KEYWORDS: [&str; 43] = [
+        "type",
+        "enum",
+        "const",
+        "multipleOf",
+        "maximum",
+        "exclusiveMaximum",
+        "minimum",
+        "exclusiveMinimum",
+        "maxLength",
+        "minLength",
+        "pattern",
+        "format",
+        "contentMediaType",
+        "contentEncoding",
+        "contentSchema",
+        "maxItems",
+        "minItems",
+        "uniqueItems",
+        "maxContains",
+        "minContains",
+        "maxProperties",
+        "minProperties",
+        "required",
+        "dependentRequired",
+        "allOf",
+        "anyOf",
+        "oneOf",
+        "not",
+        "items",
+        "prefixItems",
+        "contains",
+        "additionalItems",
+        "unevaluatedItems",
+        "properties",
+        "patternProperties",
+        "additionalProperties",
+        "unevaluatedProperties",
+        "propertyNames",
+        "dependentSchemas",
+        "dependencies",
+        "$ref",
+        "$dynamicRef",
+        "$recursiveRef",
+    ];
+
+    fn for_each_subschema(node: &Map<String, Value>, mut visit: impl FnMut(&Value, &str)) {
+        for keyword in [
+            "properties",
+            "patternProperties",
+            "dependentSchemas",
+            "dependencies",
+            "$defs",
+            "definitions",
+        ] {
+            if let Some(children) = node.get(keyword).and_then(Value::as_object) {
+                for child in children.values() {
+                    visit(child, keyword);
+                }
+            }
+        }
+        for keyword in ["allOf", "anyOf", "oneOf", "prefixItems"] {
+            if let Some(children) = node.get(keyword).and_then(Value::as_array) {
+                for child in children {
+                    visit(child, keyword);
+                }
+            }
+        }
+        for keyword in [
+            "items",
+            "contains",
+            "not",
+            "propertyNames",
+            "if",
+            "then",
+            "else",
+            "additionalProperties",
+            "unevaluatedProperties",
+            "additionalItems",
+            "unevaluatedItems",
+            "contentSchema",
+        ] {
+            let Some(child) = node.get(keyword) else {
+                continue;
+            };
+            if keyword == "items"
+                && let Some(children) = child.as_array()
+            {
+                for child in children {
+                    visit(child, keyword);
+                }
+                continue;
+            }
+            visit(child, keyword);
+        }
+    }
+
+    fn schema_declares_id(schema: &Value, depth: usize) -> bool {
+        if depth > 64 {
+            return false;
+        }
+        let Some(node) = schema.as_object() else {
+            return false;
+        };
+        if node
+            .get("$id")
+            .and_then(Value::as_str)
+            .is_some_and(|id| !id.is_empty())
+        {
+            return true;
+        }
+        let mut found = false;
+        for_each_subschema(node, |child, _| {
+            found |= schema_declares_id(child, depth + 1);
+        });
+        found
+    }
+
+    fn inspector_findings(schema: &Value) -> Vec<&'static str> {
+        fn walk(
+            schema: &Value,
+            parent_keyword: Option<&str>,
+            depth: usize,
+            has_embedded_ids: bool,
+            findings: &mut Vec<&'static str>,
+        ) {
+            if depth > 64 {
+                return;
+            }
+            if schema.is_boolean() {
+                if parent_keyword.is_none_or(|keyword| !BOOLEAN_SCHEMA_KEYWORDS.contains(&keyword))
+                {
+                    findings.push("boolean-schema");
+                }
+                return;
+            }
+            let Some(node) = schema.as_object() else {
+                return;
+            };
+            if node
+                .get("type")
+                .and_then(Value::as_array)
+                .is_some_and(|types| {
+                    !types.is_empty()
+                        && types.iter().all(|item| {
+                            item.as_str()
+                                .is_some_and(|name| JSON_SCHEMA_TYPES.contains(&name))
+                        })
+                        && types
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .collect::<HashSet<_>>()
+                            .len()
+                            == types.len()
+                })
+            {
+                findings.push("type-union");
+            }
+            if !has_embedded_ids
+                && node
+                    .get("$ref")
+                    .and_then(Value::as_str)
+                    .is_some_and(|reference| !reference.is_empty() && !reference.starts_with('#'))
+            {
+                findings.push("remote-ref");
+            }
+            let constrains = node
+                .keys()
+                .any(|keyword| CONSTRAINING_KEYWORDS.contains(&keyword.as_str()))
+                || (node.contains_key("if")
+                    && (node.contains_key("then") || node.contains_key("else")));
+            if !constrains && parent_keyword != Some("not") {
+                findings.push("untyped-schema");
+            }
+            for_each_subschema(node, |child, keyword| {
+                walk(child, Some(keyword), depth + 1, has_embedded_ids, findings);
+            });
+        }
+
+        let has_embedded_ids = schema_declares_id(schema, 0);
+        let mut findings = Vec::new();
+        walk(schema, None, 0, has_embedded_ids, &mut findings);
+        findings
+    }
+
+    fn validates(schema: &Value, instance: &Value) -> bool {
+        jsonschema::validator_for(schema)
+            .expect("published schema compiles")
+            .is_valid(instance)
+    }
+
+    fn portable_schema<T: schemars::JsonSchema>() -> (Value, Value) {
+        let raw = serde_json::to_value(schemars::schema_for!(T)).expect("schema serializes");
+        let mut portable = raw.clone();
+        normalize_portable_schema(&mut portable, None);
+        (raw, portable)
+    }
 
     /// The version a client is told must be the version that was built.
     ///
@@ -522,5 +855,128 @@ mod tests {
             handler.get_info().server_info.version,
             env!("CARGO_PKG_VERSION"),
         );
+    }
+
+    #[test]
+    fn catalog_schemas_pass_mcp_inspector_portability_rules() {
+        let mut findings = Vec::new();
+        for files_enabled in [false, true] {
+            for tool in catalog_tools(files_enabled) {
+                let mut schemas =
+                    vec![("inputSchema", Value::Object((*tool.input_schema).clone()))];
+                if let Some(output) = tool.output_schema {
+                    schemas.push(("outputSchema", Value::Object((*output).clone())));
+                }
+                for (kind, schema) in schemas {
+                    for rule in inspector_findings(&schema) {
+                        findings.push(format!(
+                            "files={files_enabled} {}.{kind}: {rule}",
+                            tool.name
+                        ));
+                    }
+                }
+            }
+        }
+        assert!(findings.is_empty(), "{findings:#?}");
+    }
+
+    #[test]
+    fn portable_schemas_preserve_nullable_request_domains() {
+        let (raw_stop, portable_stop) = portable_schema::<StopParams>();
+        for request in [
+            json!({}),
+            json!({"playback": null}),
+            json!({"playback": "play_123"}),
+        ] {
+            assert!(validates(&raw_stop, &request), "raw stop: {request}");
+            assert!(
+                validates(&portable_stop, &request),
+                "portable stop: {request}"
+            );
+        }
+        for request in [json!({"playback": 7}), json!({"unexpected": true})] {
+            assert_eq!(
+                validates(&raw_stop, &request),
+                validates(&portable_stop, &request),
+                "stop normalization changed the value domain for {request}"
+            );
+        }
+
+        let (raw_submit, portable_submit) = portable_schema::<SubmitParams>();
+        for request in [
+            json!({"source": "data:image/png;base64,eA=="}),
+            json!({"source": {"uri": "data:image/png;base64,eA=="}}),
+            json!({
+                "source": {
+                    "uri": "mcp-file://matrix/asset",
+                    "name": null,
+                    "mimeType": null,
+                    "size": null
+                }
+            }),
+            json!({
+                "source": {
+                    "uri": "mcp-file://matrix/asset",
+                    "name": "clip.gif",
+                    "mimeType": "image/gif",
+                    "size": 42
+                }
+            }),
+        ] {
+            assert!(validates(&raw_submit, &request), "raw submit: {request}");
+            assert!(
+                validates(&portable_submit, &request),
+                "portable submit: {request}"
+            );
+        }
+        for request in [
+            json!({}),
+            json!({"source": {"name": "clip.gif"}}),
+            json!({"source": {"uri": "mcp-file://matrix/asset", "size": "42"}}),
+        ] {
+            assert_eq!(
+                validates(&raw_submit, &request),
+                validates(&portable_submit, &request),
+                "submit normalization changed the value domain for {request}"
+            );
+        }
+    }
+
+    #[test]
+    fn portable_schema_normalization_preserves_edge_case_domains() {
+        for original in [Value::Bool(true), Value::Bool(false)] {
+            let mut portable = original.clone();
+            normalize_portable_schema(&mut portable, None);
+            for instance in [
+                json!(null),
+                json!(true),
+                json!(7),
+                json!("value"),
+                json!([1, 2]),
+                json!({"nested": true}),
+            ] {
+                assert_eq!(
+                    validates(&original, &instance),
+                    validates(&portable, &instance),
+                    "boolean schema normalization changed the value domain for {instance}"
+                );
+            }
+        }
+
+        let original = json!({
+            "type": ["string", "null"],
+            "anyOf": [{"maxLength": 3}]
+        });
+        let mut portable = original.clone();
+        normalize_portable_schema(&mut portable, None);
+        for instance in [json!(null), json!("ok"), json!("long"), json!(7), json!({})] {
+            assert_eq!(
+                validates(&original, &instance),
+                validates(&portable, &instance),
+                "type-union normalization changed the value domain for {instance}"
+            );
+        }
+        assert!(portable.get("type").is_none());
+        assert!(portable["allOf"][0]["anyOf"].is_array());
     }
 }

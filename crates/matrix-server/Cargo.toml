@@ -52,3 +52,4 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tokio = { version = "1", features = ["full", "test-util"] }
 # The wire test declares a real digest, so it hashes the payload the way a caller would.
 sha2 = "0.10"
+jsonschema = { version = "0.52", default-features = false }
