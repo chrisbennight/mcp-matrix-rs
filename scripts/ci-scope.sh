@@ -29,6 +29,7 @@ else
       crates/*/tests/*|crates/*/benches/*) rust=true ;;
       crates/*/*.md) ;;
       crates/*) rust=true; image=true ;;
+      smoke/expected-tools.txt) rust=true; image=true ;;
       Dockerfile|.dockerignore|LICENSE|NOTICE|smoke/*) image=true ;;
     esac
   done <"$changed_files"
