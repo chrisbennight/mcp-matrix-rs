@@ -3,7 +3,6 @@
 # mcp-matrix-rs
 
 [![test](https://github.com/chrisbennight/mcp-matrix-rs/actions/workflows/test.yml/badge.svg)](https://github.com/chrisbennight/mcp-matrix-rs/actions/workflows/test.yml)
-[![image](https://github.com/chrisbennight/mcp-matrix-rs/actions/workflows/image.yml/badge.svg)](https://github.com/chrisbennight/mcp-matrix-rs/actions/workflows/image.yml)
 [![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![release](https://img.shields.io/github/v/release/chrisbennight/mcp-matrix-rs)](https://github.com/chrisbennight/mcp-matrix-rs/releases)
 
